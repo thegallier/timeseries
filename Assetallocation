@@ -1,0 +1,123 @@
+#https://arxiv.org/pdf/2206.03246
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+# Time2Vec implementation
+class Time2Vec(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(Time2Vec, self).__init__()
+        self.omega = nn.Parameter(torch.randn(output_size))
+        self.phi = nn.Parameter(torch.randn(output_size))
+        self.linear = nn.Linear(input_size, 1)
+
+    def forward(self, t):
+        t_linear = self.linear(t)
+        time_vec = torch.cat([torch.sin(self.omega * t_linear + self.phi), t_linear], dim=-1)
+        return time_vec
+
+# Multi-Head Attention Mechanism
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+
+        self.qkv_linear = nn.Linear(d_model, d_model * 3)
+        self.out_linear = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        qkv = self.qkv_linear(x).chunk(3, dim=-1)  # Split Q, K, V
+        q, k, v = qkv
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_model)
+        attn_weights = torch.softmax(scores, dim=-1)
+        context = torch.matmul(attn_weights, v)
+        return self.out_linear(context)
+
+# Gated Residual Network
+class GatedResidualNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(GatedResidualNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.elu = nn.ELU()
+        self.fc2 = nn.Linear(hidden_size, input_size)
+        self.glu = nn.GLU()
+
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.elu(x)
+        x = self.fc2(x)
+        return residual + self.glu(x)
+
+# Transformer Encoder Block
+class TransformerEncoder(nn.Module):
+    def __init__(self, d_model, num_heads, hidden_size):
+        super(TransformerEncoder, self).__init__()
+        self.attention = MultiHeadAttention(d_model, num_heads)
+        self.grn = GatedResidualNetwork(d_model, hidden_size)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        attn_output = self.attention(x)
+        x = self.norm(x + attn_output)
+        x = self.norm(x + self.grn(x))
+        return x
+
+# Transformer Decoder Block
+class TransformerDecoder(nn.Module):
+    def __init__(self, d_model, num_heads, hidden_size):
+        super(TransformerDecoder, self).__init__()
+        self.attention = MultiHeadAttention(d_model, num_heads)
+        self.encoder_attention = MultiHeadAttention(d_model, num_heads)
+        self.grn = GatedResidualNetwork(d_model, hidden_size)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, enc_output):
+        attn_output = self.attention(x)
+        x = self.norm(x + attn_output)
+        enc_attn_output = self.encoder_attention(x, enc_output)
+        x = self.norm(x + enc_attn_output)
+        x = self.norm(x + self.grn(x))
+        return x
+
+# Portfolio Transformer Model
+class PortfolioTransformer(nn.Module):
+    def __init__(self, input_size, d_model, num_heads, hidden_size, num_layers):
+        super(PortfolioTransformer, self).__init__()
+        self.time2vec = Time2Vec(input_size, d_model)
+        self.encoder_layers = nn.ModuleList([TransformerEncoder(d_model, num_heads, hidden_size) for _ in range(num_layers)])
+        self.decoder_layers = nn.ModuleList([TransformerDecoder(d_model, num_heads, hidden_size) for _ in range(num_layers)])
+        self.fc_out = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.time2vec(x)
+        for encoder in self.encoder_layers:
+            x = encoder(x)
+        for decoder in self.decoder_layers:
+            x = decoder(x, x)
+        return torch.sign(self.fc_out(x)) * torch.softmax(self.fc_out(x), dim=-1)
+
+# Loss function (Sharpe Ratio)
+def sharpe_loss(returns, portfolio_returns, transaction_cost=0.0002):
+    expected_return = torch.mean(portfolio_returns)
+    volatility = torch.std(portfolio_returns)
+    sharpe_ratio = expected_return / volatility
+    return -sharpe_ratio  # Negative Sharpe ratio for minimization
+
+# Training Loop Example
+def train(model, optimizer, data_loader, num_epochs):
+    for epoch in range(num_epochs):
+        for batch in data_loader:
+            optimizer.zero_grad()
+            portfolio_returns = model(batch)
+            loss = sharpe_loss(batch['returns'], portfolio_returns)
+            loss.backward()
+            optimizer.step()
+
+# Example Usage
+model = PortfolioTransformer(input_size=10, d_model=64, num_heads=8, hidden_size=128, num_layers=4)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+# Assuming data_loader is set up with proper financial data
+# train(model, optimizer, data_loader, num_epochs=100)
