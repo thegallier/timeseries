@@ -1,0 +1,153 @@
+class AssetAllocationWrapper:
+    """
+    Wrapper to train models for asset allocation based on returns.
+    """
+
+    def __init__(self, model_name, max_epochs=30):
+        """
+        Initialize the wrapper.
+
+        Args:
+            model_name (str): Name of the model to use ('TFT', 'RNN', 'DeepAR', 'NBeats', 'NHiTS', 'Baseline').
+            max_epochs (int): Maximum number of training epochs.
+        """
+        self.model_name = model_name
+        self.max_epochs = max_epochs
+        self.model = None
+
+    def prepare_data(self, df, time_idx, target, group_ids):
+        """
+        Prepare dataset for asset allocation.
+
+        Args:
+            df (pd.DataFrame): Dataset containing returns.
+            time_idx (str): Name of the time index column.
+            target (str): Name of the target column (e.g., returns).
+            group_ids (list): List of group identifier column names (e.g., securities).
+        """
+        # Ensure time_idx is integer and sort data
+        df[time_idx] = pd.to_datetime(df[time_idx])
+        df.sort_values(by=[group_ids[0], time_idx], inplace=True)
+        df[time_idx] = df[time_idx].dt.strftime('%Y%m%d').astype(int)
+
+        # Create TimeSeriesDataSet
+        max_encoder_length = 30
+        max_prediction_length = 7
+
+        self.training_cutoff = df[time_idx].max() - max_prediction_length
+
+        self.training = TimeSeriesDataSet(
+            df[df[time_idx] <= self.training_cutoff],
+            time_idx=time_idx,
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=max_encoder_length,
+            max_prediction_length=max_prediction_length,
+            static_categoricals=group_ids,
+            time_varying_known_reals=[time_idx],
+            time_varying_unknown_reals=[target],
+            target_normalizer=GroupNormalizer(groups=group_ids),
+            allow_missings=True,
+        )
+
+        self.validation = TimeSeriesDataSet.from_dataset(
+            self.training, df[df[time_idx] > self.training_cutoff], min_prediction_idx=self.training_cutoff + 1
+        )
+
+        self.batch_size = 64
+        self.train_dataloader = DataLoader(self.training, batch_size=self.batch_size, shuffle=True)
+        self.val_dataloader = DataLoader(self.validation, batch_size=self.batch_size)
+
+    def fit(self):
+        """
+        Fit the selected model.
+        """
+        # Choose the model
+        if self.model_name == 'TFT':
+            self.model = TemporalFusionTransformer.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                attention_head_size=1,
+                dropout=0.1,
+                hidden_continuous_size=8,
+                loss=QuantileLoss(),
+                log_interval=10,
+                reduce_on_plateau_patience=4,
+            )
+        elif self.model_name == 'RNN':
+            self.model = RecurrentNetwork.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                rnn_layers=2,
+                dropout=0.1,
+                loss=RMSE(),
+            )
+        elif self.model_name == 'DeepAR':
+            self.model = DeepAR.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                rnn_layers=2,
+                hidden_size=16,
+                dropout=0.1,
+            )
+        elif self.model_name == 'NBeats':
+            self.model = NBeats.from_dataset(
+                self.training,
+                learning_rate=0.03,
+            )
+        elif self.model_name == 'NHiTS':
+            self.model = NHiTS.from_dataset(
+                self.training,
+                learning_rate=0.03,
+            )
+        elif self.model_name == 'Baseline':
+            self.model = Baseline()
+        else:
+            raise ValueError(f"Model {self.model_name} is not supported.")
+
+        # Trainer
+        early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")
+        trainer = pl.Trainer(
+            max_epochs=self.max_epochs,
+            callbacks=[early_stop_callback],
+            gradient_clip_val=0.1,
+        )
+
+        # Fit the model
+        trainer.fit(self.model, train_dataloaders=self.train_dataloader, val_dataloaders=self.val_dataloader)
+
+    def predict(self, df):
+        """
+        Make predictions on new data.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing new data.
+
+        Returns:
+            pd.DataFrame: DataFrame with predictions.
+        """
+        # Prepare dataset
+        raw_predictions, x = self.model.predict(df, mode="raw", return_x=True)
+        predictions = self.model.to_prediction(raw_predictions)
+
+        # Combine predictions with input data
+        df_pred = df.copy()
+        df_pred['prediction'] = predictions
+        return df_pred
+
+    def backtest(self):
+        """
+        Perform backtesting using the validation set.
+
+        Returns:
+            pd.DataFrame: DataFrame with backtesting predictions.
+        """
+        actuals = torch.cat([y[0] for x, y in iter(self.val_dataloader)])
+        predictions = self.model.predict(self.val_dataloader)
+        df_backtest = pd.DataFrame({
+            'actual': actuals.numpy().flatten(),
+            'prediction': predictions.numpy().flatten(),
+        })
+        return df_backtest
