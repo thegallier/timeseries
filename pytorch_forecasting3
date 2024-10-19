@@ -1,0 +1,499 @@
+import torch
+from pytorch_forecasting.models.base_model import BaseModel
+from pytorch_forecasting.metrics import RMSE
+
+class AutoRegressiveModel(BaseModel):
+    """
+    Simple Autoregressive model using a Linear layer.
+    """
+
+    def __init__(self, input_size: int, output_size: int = 1, **kwargs):
+        super().__init__(**kwargs)
+        self.linear = torch.nn.Linear(input_size, output_size)
+        self.save_hyperparameters()
+
+    def forward(self, x):
+        # x["encoder_cont"] shape: (batch_size, encoder_length, input_size)
+        encoder_output = x["encoder_cont"][:, -1, :]  # Use last time step
+        prediction = self.linear(encoder_output)
+        return self.to_network_output(prediction=prediction)
+
+    @classmethod
+    def from_dataset(cls, dataset, **kwargs):
+        new_kwargs = {
+            "input_size": len(dataset.reals),
+            "loss": RMSE(),
+        }
+        new_kwargs.update(kwargs)
+        return super().from_dataset(dataset, **new_kwargs)
+
+import torch
+from pytorch_forecasting.models.base_model import BaseModelWithCovariates
+from pytorch_forecasting.metrics import RMSE
+
+class LSTMForecaster(BaseModelWithCovariates):
+    """
+    LSTM-based Forecaster.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float = 0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.output_layer = torch.nn.Linear(hidden_size, 1)
+        self.save_hyperparameters()
+
+    def forward(self, x):
+        # Concatenate continuous and categorical variables
+        encoder_input = x["encoder_cont"]  # Shape: (batch_size, seq_len, input_size)
+        output, (hidden, cell) = self.lstm(encoder_input)
+        # Use the last hidden state
+        hidden_last = hidden[-1]
+        prediction = self.output_layer(hidden_last)
+        return self.to_network_output(prediction=prediction)
+
+    @classmethod
+    def from_dataset(cls, dataset, **kwargs):
+        new_kwargs = {
+            "input_size": len(dataset.reals),
+            "loss": RMSE(),
+        }
+        new_kwargs.update(kwargs)
+        return super().from_dataset(dataset, **new_kwargs)
+
+import torch
+from pytorch_forecasting.models.base_model import BaseModelWithCovariates
+from pytorch_forecasting.metrics import RMSE
+from torch.nn.utils import weight_norm
+
+class Chomp1d(torch.nn.Module):
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+class TemporalBlock(torch.nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = weight_norm(torch.nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                                                 stride=stride, padding=padding, dilation=dilation))
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = torch.nn.ReLU()
+        self.dropout1 = torch.nn.Dropout(dropout)
+
+        self.net = torch.nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1)
+        self.downsample = torch.nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = torch.nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        self.conv1.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TemporalConvNet(torch.nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size, stride=1, dilation=dilation_size,
+                                     padding=(kernel_size-1) * dilation_size, dropout=dropout)]
+        self.network = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+class TCNForecaster(BaseModelWithCovariates):
+    """
+    Temporal Convolutional Network Forecaster.
+    """
+
+    def __init__(self, input_size: int, num_channels: list, kernel_size: int = 2, dropout: float = 0.2, **kwargs):
+        super().__init__(**kwargs)
+        self.tcn = TemporalConvNet(input_size, num_channels, kernel_size=kernel_size, dropout=dropout)
+        self.output_layer = torch.nn.Linear(num_channels[-1], 1)
+        self.save_hyperparameters()
+
+    def forward(self, x):
+        # x["encoder_cont"] shape: (batch_size, seq_len, input_size)
+        encoder_input = x["encoder_cont"].permute(0, 2, 1)  # Reshape to (batch_size, input_size, seq_len)
+        tcn_output = self.tcn(encoder_input)
+        # Use the last time step
+        last_output = tcn_output[:, :, -1]
+        prediction = self.output_layer(last_output)
+        return self.to_network_output(prediction=prediction)
+
+    @classmethod
+    def from_dataset(cls, dataset, **kwargs):
+        new_kwargs = {
+            "input_size": len(dataset.reals),
+            "loss": RMSE(),
+        }
+        new_kwargs.update(kwargs)
+        return super().from_dataset(dataset, **new_kwargs)
+
+import torch
+from pytorch_forecasting.models.base_model import BaseModel
+from pytorch_forecasting.metrics import RMSE
+
+class ProphetLikeModel(BaseModel):
+    """
+    Simplified Prophet-like model capturing trend and seasonality.
+    """
+
+    def __init__(self, seasonality: int, **kwargs):
+        super().__init__(**kwargs)
+        self.trend = torch.nn.Linear(1, 1)
+        self.seasonality = torch.nn.Linear(seasonality, 1)
+        self.save_hyperparameters()
+
+    def forward(self, x):
+        time = x["encoder_cont"][:, :, 0]  # Assuming the first real variable is time
+        time = time.unsqueeze(-1)
+        trend = self.trend(time)
+
+        seasonal_features = x["encoder_cont"][:, :, 1:self.hparams.seasonality+1]
+        seasonality = self.seasonality(seasonal_features)
+
+        prediction = trend + seasonality
+        # Use the last time step
+        prediction = prediction[:, -1, :]
+        return self.to_network_output(prediction=prediction)
+
+    @classmethod
+    def from_dataset(cls, dataset, **kwargs):
+        new_kwargs = {
+            "loss": RMSE(),
+            "seasonality": 10,  # Example value, adjust as needed
+        }
+        new_kwargs.update(kwargs)
+        return super().from_dataset(dataset, **new_kwargs)
+
+class ClassificationWrapper:
+    """
+    Wrapper to train classification models on n securities by combining two datasets.
+    """
+
+    def __init__(self, model_name, max_epochs=30):
+        """
+        Initialize the wrapper.
+
+        Args:
+            model_name (str): Name of the model to use ('TFT', 'RNN', 'DeepAR', 'NBeats', 'NHiTS', 'Baseline', 'AutoRegressive', 'LSTM', 'TCN', 'ProphetLike').
+            max_epochs (int): Maximum number of training epochs.
+        """
+        self.model_name = model_name
+        self.max_epochs = max_epochs
+        self.model = None
+
+    def prepare_data(self, df1, df2, time_idx, target, group_ids, classification=True):
+        """
+        Prepare combined dataset for classification.
+
+        Args:
+            df1 (pd.DataFrame): First dataset.
+            df2 (pd.DataFrame): Second dataset.
+            time_idx (str): Name of the time index column.
+            target (str): Name of the target column.
+            group_ids (list): List of group identifier column names.
+            classification (bool): Whether the task is classification.
+        """
+        # Combine datasets
+        df = pd.concat([df1, df2], ignore_index=True)
+
+        # Ensure time_idx is integer and sort data
+        df[time_idx] = pd.to_datetime(df[time_idx])
+        df.sort_values(by=[group_ids[0], time_idx], inplace=True)
+        df[time_idx] = df[time_idx].dt.strftime('%Y%m%d').astype(int)
+
+        # Create TimeSeriesDataSet
+        max_encoder_length = 30
+        max_prediction_length = 7
+
+        self.training_cutoff = df[time_idx].max() - max_prediction_length
+
+        self.training = TimeSeriesDataSet(
+            df[df[time_idx] <= self.training_cutoff],
+            time_idx=time_idx,
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=max_encoder_length,
+            max_prediction_length=max_prediction_length,
+            static_categoricals=group_ids,
+            time_varying_known_reals=[time_idx],
+            time_varying_unknown_reals=[target],
+            target_normalizer=None,  # For classification, we typically do not normalize the target
+            allow_missings=True,
+        )
+
+        self.validation = TimeSeriesDataSet.from_dataset(
+            self.training, df[df[time_idx] > self.training_cutoff], min_prediction_idx=self.training_cutoff + 1
+        )
+
+        self.batch_size = 64
+        self.train_dataloader = DataLoader(self.training, batch_size=self.batch_size, shuffle=True)
+        self.val_dataloader = DataLoader(self.validation, batch_size=self.batch_size)
+
+    def fit(self):
+        """
+        Fit the selected model.
+        """
+        # Choose the model
+        if self.model_name == 'TFT':
+            self.model = TemporalFusionTransformer.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                attention_head_size=1,
+                dropout=0.1,
+                hidden_continuous_size=8,
+                output_size=1,  # Binary classification
+                loss=torch.nn.BCEWithLogitsLoss(),
+                log_interval=10,
+                reduce_on_plateau_patience=4,
+            )
+        elif self.model_name == 'RNN':
+            self.model = RecurrentNetwork.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                rnn_layers=2,
+                dropout=0.1,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'DeepAR':
+            self.model = DeepAR.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                rnn_layers=2,
+                hidden_size=16,
+                dropout=0.1,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'NBeats':
+            self.model = NBeats.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'NHiTS':
+            self.model = NHiTS.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'Baseline':
+            self.model = Baseline()
+        elif self.model_name == 'AutoRegressive':
+            self.model = AutoRegressiveModel.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'LSTM':
+            self.model = LSTMForecaster.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                num_layers=2,
+                dropout=0.1,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'TCN':
+            self.model = TCNForecaster.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                num_channels=[16]*3,
+                kernel_size=2,
+                dropout=0.1,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        elif self.model_name == 'ProphetLike':
+            self.model = ProphetLikeModel.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                seasonality=10,
+                loss=torch.nn.BCEWithLogitsLoss(),
+            )
+        else:
+            raise ValueError(f"Model {self.model_name} is not supported.")
+
+        # Trainer
+        early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")
+        trainer = pl.Trainer(
+            max_epochs=self.max_epochs,
+            callbacks=[early_stop_callback],
+            gradient_clip_val=0.1,
+        )
+
+        # Fit the model
+        trainer.fit(self.model, train_dataloaders=self.train_dataloader, val_dataloaders=self.val_dataloader)
+
+    # The predict and backtest methods remain the same.
+
+class AssetAllocationWrapper:
+    """
+    Wrapper to train models for asset allocation based on returns.
+    """
+
+    def __init__(self, model_name, max_epochs=30):
+        """
+        Initialize the wrapper.
+
+        Args:
+            model_name (str): Name of the model to use ('TFT', 'RNN', 'DeepAR', 'NBeats', 'NHiTS', 'Baseline', 'AutoRegressive', 'LSTM', 'TCN', 'ProphetLike').
+            max_epochs (int): Maximum number of training epochs.
+        """
+        self.model_name = model_name
+        self.max_epochs = max_epochs
+        self.model = None
+
+    def prepare_data(self, df, time_idx, target, group_ids):
+        """
+        Prepare dataset for asset allocation.
+
+        Args:
+            df (pd.DataFrame): Dataset containing returns.
+            time_idx (str): Name of the time index column.
+            target (str): Name of the target column (e.g., returns).
+            group_ids (list): List of group identifier column names (e.g., securities).
+        """
+        # Ensure time_idx is integer and sort data
+        df[time_idx] = pd.to_datetime(df[time_idx])
+        df.sort_values(by=[group_ids[0], time_idx], inplace=True)
+        df[time_idx] = df[time_idx].dt.strftime('%Y%m%d').astype(int)
+
+        # Create TimeSeriesDataSet
+        max_encoder_length = 30
+        max_prediction_length = 7
+
+        self.training_cutoff = df[time_idx].max() - max_prediction_length
+
+        self.training = TimeSeriesDataSet(
+            df[df[time_idx] <= self.training_cutoff],
+            time_idx=time_idx,
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=max_encoder_length,
+            max_prediction_length=max_prediction_length,
+            static_categoricals=group_ids,
+            time_varying_known_reals=[time_idx],
+            time_varying_unknown_reals=[target],
+            target_normalizer=GroupNormalizer(groups=group_ids),
+            allow_missings=True,
+        )
+
+        self.validation = TimeSeriesDataSet.from_dataset(
+            self.training, df[df[time_idx] > self.training_cutoff], min_prediction_idx=self.training_cutoff + 1
+        )
+
+        self.batch_size = 64
+        self.train_dataloader = DataLoader(self.training, batch_size=self.batch_size, shuffle=True)
+        self.val_dataloader = DataLoader(self.validation, batch_size=self.batch_size)
+
+    def fit(self):
+        """
+        Fit the selected model.
+        """
+        # Choose the model
+        if self.model_name == 'TFT':
+            self.model = TemporalFusionTransformer.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                attention_head_size=1,
+                dropout=0.1,
+                hidden_continuous_size=8,
+                loss=QuantileLoss(),
+                log_interval=10,
+                reduce_on_plateau_patience=4,
+            )
+        elif self.model_name == 'RNN':
+            self.model = RecurrentNetwork.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                rnn_layers=2,
+                dropout=0.1,
+                loss=RMSE(),
+            )
+        elif self.model_name == 'DeepAR':
+            self.model = DeepAR.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                rnn_layers=2,
+                hidden_size=16,
+                dropout=0.1,
+            )
+        elif self.model_name == 'NBeats':
+            self.model = NBeats.from_dataset(
+                self.training,
+                learning_rate=0.03,
+            )
+        elif self.model_name == 'NHiTS':
+            self.model = NHiTS.from_dataset(
+                self.training,
+                learning_rate=0.03,
+            )
+        elif self.model_name == 'Baseline':
+            self.model = Baseline()
+        elif self.model_name == 'AutoRegressive':
+            self.model = AutoRegressiveModel.from_dataset(
+                self.training,
+                learning_rate=0.03,
+            )
+        elif self.model_name == 'LSTM':
+            self.model = LSTMForecaster.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                hidden_size=16,
+                num_layers=2,
+                dropout=0.1,
+            )
+        elif self.model_name == 'TCN':
+            self.model = TCNForecaster.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                num_channels=[16]*3,
+                kernel_size=2,
+                dropout=0.1,
+            )
+        elif self.model_name == 'ProphetLike':
+            self.model = ProphetLikeModel.from_dataset(
+                self.training,
+                learning_rate=0.03,
+                seasonality=10,
+            )
+        else:
+            raise ValueError(f"Model {self.model_name} is not supported.")
+
+        # Trainer
+        early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")
+        trainer = pl.Trainer(
+            max_epochs=self.max_epochs,
+            callbacks=[early_stop_callback],
+            gradient_clip_val=0.1,
+        )
+
+        # Fit the model
+        trainer.fit(self.model, train_dataloaders=self.train_dataloader, val_dataloaders=self.val_dataloader)
+
+    # The predict and backtest methods remain the same.
+
+# Assuming df is your dataset with columns: 'time', 'group_id', 'returns'
+wrapper = AssetAllocationWrapper(model_name='LSTM', max_epochs=20)
+wrapper.prepare_data(df, time_idx='time', target='returns', group_ids=['group_id'])
+wrapper.fit()
+backtest_results = wrapper.backtest()
+print(backtest_results.head())
+
