@@ -1,0 +1,58 @@
+
+# https://arxiv.org/pdf/2406.10214
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class RandomFeatureNeuralNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(RandomFeatureNeuralNetwork, self).__init__()
+        # Randomly initialized hidden weights
+        self.hidden_weights = nn.Parameter(torch.randn(hidden_dim, input_dim), requires_grad=False)
+        self.hidden_bias = nn.Parameter(torch.randn(hidden_dim), requires_grad=False)
+        self.output_weights = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        hidden_layer = torch.tanh(torch.matmul(x, self.hidden_weights.T) + self.hidden_bias)
+        return self.output_weights(hidden_layer)
+
+class RandomisedSignatureGenerator(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(RandomisedSignatureGenerator, self).__init__()
+        self.reservoir = RandomFeatureNeuralNetwork(input_dim, hidden_dim, hidden_dim)
+        self.readout = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.reservoir(x)
+        return self.readout(x)
+
+# Model parameters
+input_dim = 10  # Time series input dimension
+hidden_dim = 50  # Hidden dimension of reservoir
+output_dim = 10  # Output dimension for generated time series
+
+# Create generator model
+generator = RandomisedSignatureGenerator(input_dim, hidden_dim, output_dim)
+
+# Sample input data (e.g., synthetic time series data)
+input_data = torch.randn(100, input_dim)
+
+# Forward pass
+output_data = generator(input_data)
+
+# Loss function and optimizer
+criterion = nn.MSELoss()
+optimizer = optim.Adam(generator.parameters(), lr=0.001)
+
+# Training loop (example)
+epochs = 100
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    output = generator(input_data)
+    loss = criterion(output, input_data)  # Example loss (reconstruction)
+    loss.backward()
+    optimizer.step()
+    if epoch % 10 == 0:
+        print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item()}')
+
+print("Model training complete.")
