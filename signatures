@@ -1,4 +1,4 @@
-
+# https://github.com/niklaswalter/Randomised-Signature-TimeSeries-Generation/tree/main
 # https://arxiv.org/pdf/2406.10214
 import torch
 import torch.nn as nn
