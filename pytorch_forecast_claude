@@ -1,0 +1,423 @@
+"""
+Financial Time Series Forecasting Package
+---------------------------------------
+A comprehensive package for financial time series forecasting using various deep learning models.
+
+This package includes:
+- Multiple model architectures (AutoRegressive, LSTM, TCN, ProphetLike)
+- Data validation and preprocessing
+- Model checkpointing and logging
+- Configuration management
+- Comprehensive testing suite
+
+Author: Assistant
+Date: 2024-10-20
+Version: 1.0.0
+"""
+
+import logging
+import yaml
+import torch
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Tuple, Union
+from datetime import datetime, timedelta
+from pytorch_lightning.callbacks import EarlyStopping
+from torch.utils.data import DataLoader
+from pytorch_forecasting import TimeSeriesDataSet
+from pytorch_forecasting.metrics import RMSE, QuantileLoss
+from scipy import stats
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ModelConfig:
+    """Configuration class for model parameters.
+    
+    Attributes:
+        model_name (str): Name of the model to use
+        max_epochs (int): Maximum number of training epochs
+        batch_size (int): Batch size for training
+        learning_rate (float): Learning rate for optimization
+        hidden_size (int): Number of hidden units in layers
+        dropout (float): Dropout rate for regularization
+        max_encoder_length (int): Maximum length of encoder sequence
+        max_prediction_length (int): Maximum length of prediction sequence
+    """
+    model_name: str
+    max_epochs: int = 30
+    batch_size: int = 64
+    learning_rate: float = 0.03
+    hidden_size: int = 16
+    dropout: float = 0.1
+    max_encoder_length: int = 30
+    max_prediction_length: int = 7
+    
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> 'ModelConfig':
+        """Load configuration from YAML file.
+        
+        Args:
+            yaml_path: Path to YAML configuration file
+            
+        Returns:
+            ModelConfig instance
+        """
+        with open(yaml_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+        return cls(**config_dict)
+    
+    def to_yaml(self, yaml_path: str) -> None:
+        """Save configuration to YAML file.
+        
+        Args:
+            yaml_path: Path to save configuration
+        """
+        with open(yaml_path, 'w') as f:
+            yaml.dump(self.__dict__, f)
+
+class DataValidator:
+    """Data validation utilities."""
+    
+    @staticmethod
+    def validate_dataframe(df: pd.DataFrame, required_columns: List[str]) -> bool:
+        """Validate DataFrame structure and content.
+        
+        Args:
+            df: Input DataFrame
+            required_columns: List of required column names
+            
+        Returns:
+            bool: True if validation passes
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        # Check for required columns
+        missing_cols = set(required_columns) - set(df.columns)
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+            
+        # Check for null values
+        null_cols = df.columns[df.isnull().any()].tolist()
+        if null_cols:
+            raise ValueError(f"Null values found in columns: {null_cols}")
+            
+        # Check for infinite values
+        inf_cols = df.columns[np.isinf(df.select_dtypes(include=np.number)).any()].tolist()
+        if inf_cols:
+            raise ValueError(f"Infinite values found in columns: {inf_cols}")
+            
+        return True
+
+class ModelCheckpointer:
+    """Model checkpointing utilities."""
+    
+    def __init__(self, checkpoint_dir: str):
+        """Initialize checkpointer.
+        
+        Args:
+            checkpoint_dir: Directory to store checkpoints
+        """
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+    def save_checkpoint(self, model: torch.nn.Module, epoch: int, 
+                       optimizer: torch.optim.Optimizer, loss: float) -> str:
+        """Save model checkpoint.
+        
+        Args:
+            model: PyTorch model
+            epoch: Current epoch number
+            optimizer: PyTorch optimizer
+            loss: Current loss value
+            
+        Returns:
+            str: Path to saved checkpoint
+        """
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
+        }, checkpoint_path)
+        return str(checkpoint_path)
+        
+    def load_checkpoint(self, model: torch.nn.Module, 
+                       optimizer: torch.optim.Optimizer, 
+                       checkpoint_path: str) -> Tuple[int, float]:
+        """Load model checkpoint.
+        
+        Args:
+            model: PyTorch model
+            optimizer: PyTorch optimizer
+            checkpoint_path: Path to checkpoint file
+            
+        Returns:
+            Tuple containing (epoch_number, loss_value)
+        """
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        return checkpoint['epoch'], checkpoint['loss']
+
+class AutoRegressiveModel(pl.LightningModule):
+    """Simple Autoregressive model using a Linear layer."""
+    
+    def __init__(self, input_size: int, output_size: int = 1, **kwargs):
+        """Initialize AR model.
+        
+        Args:
+            input_size: Number of input features
+            output_size: Number of output features
+            **kwargs: Additional arguments
+        """
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size)
+        self.save_hyperparameters()
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Dictionary containing input tensors
+            
+        Returns:
+            Model predictions
+        """
+        encoder_output = x["encoder_cont"][:, -1, :]  # Use last time step
+        prediction = self.linear(encoder_output)
+        return prediction
+
+class LSTMForecaster(pl.LightningModule):
+    """LSTM-based Forecaster."""
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, 
+                 dropout: float = 0.0, **kwargs):
+        """Initialize LSTM model.
+        
+        Args:
+            input_size: Number of input features
+            hidden_size: Number of hidden units
+            num_layers: Number of LSTM layers
+            dropout: Dropout rate
+            **kwargs: Additional arguments
+        """
+        super().__init__()
+        self.lstm = torch.nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout
+        )
+        self.output_layer = torch.nn.Linear(hidden_size, 1)
+        self.save_hyperparameters()
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass."""
+        encoder_input = x["encoder_cont"]
+        output, (hidden, _) = self.lstm(encoder_input)
+        prediction = self.output_layer(hidden[-1])
+        return prediction
+
+class TCNBlock(torch.nn.Module):
+    """Temporal Convolutional Network block."""
+    
+    def __init__(self, n_inputs: int, n_outputs: int, kernel_size: int, 
+                 stride: int, dilation: int, padding: int, dropout: float = 0.2):
+        """Initialize TCN block."""
+        super().__init__()
+        self.conv1 = torch.nn.Conv1d(
+            n_inputs, n_outputs, kernel_size,
+            stride=stride, padding=padding, dilation=dilation
+        )
+        self.chomp1 = torch.nn.functional.pad  # Remove future timesteps
+        self.relu1 = torch.nn.ReLU()
+        self.dropout1 = torch.nn.Dropout(dropout)
+
+        self.net = torch.nn.Sequential(
+            self.conv1,
+            self.relu1,
+            self.dropout1
+        )
+        
+        self.downsample = torch.nn.Conv1d(n_inputs, n_outputs, 1) \
+            if n_inputs != n_outputs else None
+        self.relu = torch.nn.ReLU()
+        self.init_weights()
+
+    def init_weights(self):
+        """Initialize network weights."""
+        self.conv1.weight.data.normal_(0, 0.01)
+        if self.downsample is not None:
+            self.downsample.weight.data.normal_(0, 0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TCNForecaster(pl.LightningModule):
+    """Temporal Convolutional Network Forecaster."""
+    
+    def __init__(self, input_size: int, num_channels: List[int], 
+                 kernel_size: int = 2, dropout: float = 0.2, **kwargs):
+        """Initialize TCN model."""
+        super().__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = input_size if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TCNBlock(
+                in_channels, out_channels, kernel_size, stride=1,
+                dilation=dilation_size,
+                padding=(kernel_size-1) * dilation_size,
+                dropout=dropout
+            )]
+        
+        self.network = torch.nn.Sequential(*layers)
+        self.output_layer = torch.nn.Linear(num_channels[-1], 1)
+        self.save_hyperparameters()
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass."""
+        encoder_input = x["encoder_cont"].permute(0, 2, 1)
+        output = self.network(encoder_input)
+        output = output[:, :, -1]  # Take last time step
+        prediction = self.output_layer(output)
+        return prediction
+
+class ProphetLikeModel(pl.LightningModule):
+    """Prophet-like model capturing trend and seasonality."""
+    
+    def __init__(self, seasonality: int, **kwargs):
+        """Initialize Prophet-like model."""
+        super().__init__()
+        self.trend = torch.nn.Linear(1, 1)
+        self.seasonality = torch.nn.Linear(seasonality, 1)
+        self.save_hyperparameters()
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward pass."""
+        time = x["encoder_cont"][:, :, 0].unsqueeze(-1)
+        trend = self.trend(time)
+        
+        seasonal_features = x["encoder_cont"][:, :, 1:self.hparams.seasonality+1]
+        seasonality = self.seasonality(seasonal_features)
+        
+        prediction = trend + seasonality
+        return prediction[:, -1, :]
+
+class BaseWrapper:
+    """Base wrapper for all models."""
+    
+    def __init__(self, config: ModelConfig):
+        """Initialize wrapper."""
+        self.config = config
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+        self.validator = DataValidator()
+        self.checkpointer = ModelCheckpointer("checkpoints")
+        self.model = None
+        self.training_metrics = []
+        
+    def prepare_data(self, df: pd.DataFrame, time_idx: str, 
+                    target: str, group_ids: List[str]) -> None:
+        """Prepare data for training."""
+        # Validate data
+        self.validator.validate_dataframe(df, [time_idx, target] + group_ids)
+        
+        # Create TimeSeriesDataSet
+        self.training = TimeSeriesDataSet(
+            df[df[time_idx] <= df[time_idx].max() - self.config.max_prediction_length],
+            time_idx=time_idx,
+            target=target,
+            group_ids=group_ids,
+            max_encoder_length=self.config.max_encoder_length,
+            max_prediction_length=self.config.max_prediction_length,
+            static_categoricals=group_ids,
+            time_varying_known_reals=[time_idx],
+            time_varying_unknown_reals=[target],
+            target_normalizer=None,
+            allow_missings=True,
+        )
+        
+        self.validation = TimeSeriesDataSet.from_dataset(
+            self.training,
+            df[df[time_idx] > df[time_idx].max() - self.config.max_prediction_length],
+            min_prediction_idx=df[time_idx].max() - self.config.max_prediction_length + 1
+        )
+        
+        self.train_dataloader = DataLoader(
+            self.training, batch_size=self.config.batch_size, shuffle=True
+        )
+        self.val_dataloader = DataLoader(
+            self.validation, batch_size=self.config.batch_size
+        )
+    
+    def fit(self) -> None:
+        """Train the model."""
+        if self.model is None:
+            raise ValueError("Model not initialized")
+            
+        trainer = pl.Trainer(
+            max_epochs=self.config.max_epochs,
+            callbacks=[
+                EarlyStopping(
+                    monitor="val_loss",
+                    min_delta=1e-4,
+                    patience=5,
+                    verbose=False,
+                    mode="min"
+                )
+            ],
+            gradient_clip_val=0.1,
+        )
+        
+        trainer.fit(
+            self.model,
+            train_dataloaders=self.train_dataloader,
+            val_dataloaders=self.val_dataloader
+        )
+    
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """Make predictions."""
+        if self.model is None:
+            raise ValueError("Model not trained")
+            
+        self.model.eval()
+        with torch.no_grad():
+            predictions = self.model(
+                self.validation.to_dataloader(df, batch_size=self.config.batch_size)
+            )
+        return predictions.numpy()
+
+def generate_sample_data(n_assets: int = 5, n_days: int = 100, 
+                        seed: int = 42) -> pd.DataFrame:
+    """Generate sample financial data for testing.
+    
+    Args:
+        n_assets: Number of assets
+        n_days: Number of days
+        seed: Random seed
+        
+    Returns:
+        DataFrame containing sample data
+    """
+    np.random.seed(seed)
+    
+    dates = [datetime.today() - timedelta(days=x) for x in range(n_days)]
+    dates.reverse()
+    
+    data = {
+        'time': dates * n_assets,
+        'group_id': np
