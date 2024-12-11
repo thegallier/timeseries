@@ -1,0 +1,96 @@
+# Project Proposal: Implementation of New Machine Learning Techniques for Time Series Data in the European Bond Futures Market
+
+---
+
+## Executive Summary
+
+In the rapidly evolving landscape of financial markets, market makers and hedge funds continually seek to optimize trading strategies to improve liquidity provision, risk management, and profitability. This project proposes the implementation of modern machine learning and statistical techniques tailored for time series data in the European Government Bond (EGB) futures market. The ultimate objective is to enhance market-making price skewing and hedging capabilities, while also exploring classification methods to detect profitable conditions, potentially maximizing the Sharpe ratio over time. Since the data will likely be imbalanced—e.g., many trivial signals versus fewer critical trading opportunities—robust performance metrics such as Cohen’s Kappa will be considered. Rebalancing procedures and confidence interval estimations will be employed to ensure that the learned relationships and predictions remain statistically significant and reliable.
+
+A roadmap will outline a phased approach, beginning with classical econometric models (e.g., GARCH, PCA) and progressing toward cutting-edge approaches (e.g., Transformers, foundation models). By integrating cointegration tests, the project ensures that relationships between asset prices remain the focus, eschewing macroeconomic data. We will also implement scaling algorithms to handle increased data volumes efficiently. These steps aim at ultimately improving price quoting strategies, balancing order flow inventory risk, and enhancing hedge performance.
+
+This initiative seeks to deliver a next-generation toolkit for risk-neutral pricing, hedging, and market-making. By leveraging advanced time series analysis methods, we anticipate improved execution quality, reduced market impact, and refined control over the delicate equilibrium between order flow and inventory risk.
+
+**Selected Literature**:  
+- Market Making & Liquidity: Avellaneda, M. & Stoikov, S. (2008). "High-frequency trading in a limit order book." *Quantitative Finance, 8(3)*.  
+- Imbalanced Classification & Cohen’s Kappa: Cohen, J. (1960). "A coefficient of agreement for nominal scales." *Educational and Psychological Measurement, 20(1)*.  
+- Sharpe Ratio & Risk Management: Lo, A. (2002). "The statistics of Sharpe ratios." *Financial Analysts Journal, 58(4)*.  
+- Time Series Foundations: Shumway, R. & Stoffer, D. (2017). *Time Series Analysis and Its Applications.* Springer.
+
+---
+
+## Data Description
+
+**Instruments and Period:**  
+The dataset encompasses limit order book (LOB) and transaction-level data for seven European Government Bond (EGB) futures contracts over a 10-day period. Each security is a liquid EGB future traded on a major European derivatives exchange, providing high-frequency data samples that enable the modeling of intraday dynamics and microstructure patterns.
+
+**Order Data:**  
+We will extract all order messages (add, modify, delete) with timestamps, instrument symbols, order direction (buy or sell), price, and quantity. This granular dataset allows for modeling how order flow influences price formation and liquidity replenishment strategies.
+
+**Trade Data:**  
+All executed trades during the 10-day window will be collected, including timestamps, instrument symbols, aggressive side indicators, and quantities. Integrating this with order data enables the distinction between passive and aggressive liquidity flow, assisting in understanding market impact and inventory risk management.
+
+**Level Updates:**  
+Continuously recorded LOB level updates (best bid/ask prices, sizes, order counts) provide insights into intraday volatility, short-term price dynamics, and patterns that can inform quoting and hedging strategies.
+
+**Selected Literature**:  
+- Market Microstructure: Hasbrouck, J. (2007). *Empirical Market Microstructure.* Oxford University Press.  
+- Cointegration in Futures: Johansen, S. (1988). "Statistical analysis of cointegration vectors." *Journal of Economic Dynamics and Control, 12(2–3)*.
+
+---
+
+## Possible Feature Creation
+
+**Signatures:**  
+Path signatures capture complex order flow patterns and higher-order correlations in time series [Lyons, T. (2014). "Rough paths, signatures, and the modelling of functions on streams." *ICM Proceedings*].
+
+**Matrix Motifs:**  
+Identifying submatrix patterns in price and quantity updates to discover recurrent motifs in LOB dynamics [Mueen, A. & Keogh, E. (2010). "Finding time series motifs." *SIAM SDM*].
+
+**Dynamic Time Warping (DTW):**  
+Applying DTW to align and compare time series segments that may differ in phase or speed, aiding in clustering or pattern recognition [Berndt, D. & Clifford, J. (1994). "Using Dynamic Time Warping to Find Patterns in Time Series." *AAAI Workshop*].
+
+**Time2Vec:**  
+Encoding temporal information into feature vectors, improving neural network models’ capacity to reason about temporal patterns [Kazemi, S. M. et al. (2019). "Time2Vec: Learning a Vector Representation of Time." *NeurIPS*].
+
+**Selected Literature**:  
+- Feature Extraction: Fulcher, B. D. & Jones, N. S. (2017). "hctsa: A Computational Framework for Automated Time-Series Phenotype Characterization." *Journal of Open Research Software*.  
+- Advanced Representations: Wu, Y. et al. (2021). "A Comprehensive Survey on Graph Neural Networks." *IEEE TNNLS*.
+
+---
+
+## Methods
+
+**Traditional Methods:**  
+- **GARCH Models:** Estimate and forecast volatility for improved hedge ratios [Engle, R. (1982). *Econometrica*].  
+- **Matrix Regression & PCA:** Dimensionality reduction and factor analysis to distill signal from noise [Jolliffe, I. T. (2002). *Principal Component Analysis.* Springer].
+
+**Newer Statistical & ML Tools:**  
+- **TSA, Aeon, sktime, Nixtla, PyTorch Forecasting, Darts, Merlion:** Modern toolkits for advanced time series modeling, forecasting, and anomaly detection.  
+- **uniTs:** A multi-task time series model enabling simultaneous forecasting of multiple targets [Gao, S. et al. (2022). *arXiv: uniTs: a multi-task time series model*].  
+- **Is mamba Effective for Time Series Forecasting?:** Investigating Mamba’s performance in various forecasting settings [Wang, Z. (2023). *arXiv: Is mamba Effective for Time series Forecasting?*].  
+- **Yes. Transformers are effective for time series Forecasting (+Autoformer):** Transformers and related architectures like Autoformer improve long-range dependency modeling in time series [Zhou, H. et al. (2021). "Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting." *AAAI*].  
+- **Multi-horizon forecasting for limit order books: a novel deep learning approach:** Deep learning frameworks targeting multi-horizon forecasting in order-driven markets [Zhang, Z. (2022). "Multi-horizon forecasting for limit order books." *arXiv*].  
+- **Deep learning for market by order data:** Techniques using deep neural architectures for order-level modeling of financial data [Zhang, Z. (2023). "Deep learning for market by order data." *arXiv*].
+
+**Foundation Models, Graph Networks, and Other Advanced Approaches:**  
+- **Foundation Models for Time Series Analysis:** Liang, Y. et al. (2021). "Foundation Models for Time Series Analysis: A Tutorial and Survey."  
+- **Graph Nets & TimeGPT:** Utilize relational structures and generative pre-training for robust, scalable forecasting [Wu, Y. et al. (2020). "Connecting the Dots: Multivariate Time Series Forecasting with Graph Neural Networks." *KDD*].  
+- **Tiny Time Mixers, Mamba, Transformers:** Lightweight and transformer-based architectures capturing long-range dependencies [Vaswani, A. et al. (2017). "Attention is All You Need." *NeurIPS*].
+
+**More Mathematical Methods:**  
+- **Stiefelgen:** Manifold optimization for factor modeling in time series [Absil, P.-A. et al. (2008). *Optimization Algorithms on Matrix Manifolds.* Princeton University Press].
+
+---
+
+## Conclusion and Next Steps
+
+This proposal outlines a comprehensive plan to harness advanced machine learning and statistical methods for the European bond futures market. By focusing on price action and order flow rather than macroeconomic indicators, and by iteratively refining models from classical econometric techniques to cutting-edge neural architectures and foundation models, the project aims to deliver more effective market-making price skewing and improved hedging strategies.
+
+A structured timeline will guide this evolution, ensuring that early-stage insights from simpler models inform the deployment of more complex architectures. Continuous validation against robust performance metrics (including Cohen’s Kappa and confidence intervals) will maintain statistical rigor and operational reliability. Ultimately, this integrative approach stands to elevate the practice of liquidity provision and risk management, providing tangible benefits to market participants.
+
+---
+
+**Additional Selected Literature on Modern Methods**:  
+- Li, S. et al. (2019). "Enhancing the Locality and Breaking the Memory Bottleneck of Transformer on Time Series Forecasting." *NeurIPS*.  
+- Wu, Y. et al. (2021). "Graph Neural Networks: A Review of Methods and Applications." *AI Open*.  
+- Zhou, H. et al. (2021). "Autoformer: Decomposition Transformers with Auto-Correlation for Long-Term Series Forecasting." *NeurIPS*.
