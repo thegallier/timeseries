@@ -1,16 +1,19 @@
-```markdown
 # Project Proposal: Advanced Machine Learning Techniques for High-Frequency Time Series Analysis in the European Bond Futures Market
 
 ## Executive Summary
 
 In contemporary financial markets, the substantial volume of high-frequency data presents both an analytical challenge and a unique opportunity. These datasets—spanning millions of granular order messages, trade executions, and market state updates—reflect not only the natural ebb and flow of market conditions but also contain latent patterns left by algorithmic strategies. Identifying and exploiting these patterns can enhance price discovery, improve risk management, and optimize market-making decisions. This project seeks to uncover these structures using advanced machine learning (ML) and statistical methods specifically adapted to the European Government Bond (EGB) futures market.
 
-Our primary research questions focus on detecting, modeling, and forecasting intraday market microstructure dynamics to inform improved quoting, hedging, and inventory management strategies. By leveraging a staged approach—from classical econometric models to cutting-edge neural architectures and representation learning methods—we hypothesize that a careful blend of theoretical rigor and data-driven adaptation will yield more effective market-making price skewing and robust hedging tactics. Historically, we have investigated Markov chains for modeling order arrival distributions, comparing them with various neural network architectures. These efforts revealed Markov chains as strong contenders, offering considerable explanatory power in capturing order arrival patterns. Building on this foundation, we propose incorporating models such as Mamba—known for its ability to handle complex multi-agent behaviors—and combining it with Transformer-based architectures. The restricted yet expressive vocabulary of orders benefits particularly from Transformers, which can now consider broader contextual windows. Together, Mamba and Transformer approaches may significantly expand the scope of context and complexity that can be modeled effectively.
+Our primary research questions focus on detecting, modeling, and forecasting intraday market microstructure dynamics to inform improved quoting, hedging, and inventory management strategies. By leveraging a staged approach—from classical econometric models to cutting-edge neural architectures and representation learning methods—we hypothesize that a careful blend of theoretical rigor and data-driven adaptation will yield more effective market-making price skewing and robust hedging tactics. Historically, we have investigated Markov chains for modeling order arrival distributions, comparing them with various neural network architectures. These studies revealed Markov chains as strong contenders, offering considerable explanatory power. Building on this foundation, we propose incorporating models such as Mamba—known for handling complex multi-agent behaviors—and combining it with Transformer-based architectures to capture broader contextual windows and more nuanced order flow patterns.
 
-This work positions itself at the intersection of quantitative finance, econometrics, and applied ML. It extends existing literature on high-frequency trading (HFT) and market microstructure by introducing advanced neural architectures and feature extraction techniques designed for complex, high-dimensional data. In doing so, this project aims not only to improve economic outcomes, such as enhanced Sharpe ratios and reduced market impact, but also to contribute substantively to the academic discourse on ML-driven discovery in financial markets.
+In recent work, researchers have demonstrated the efficacy of deep neural approaches for limit order book data and market-by-order data. For instance, Zhang and Zohren (2021) explored multi-horizon forecasting in limit order books and leveraged intelligent processing units for acceleration, while Zhang, Lima, and Zohren introduced deep learning methods tailored for market-by-order data. These approaches provide concrete examples of integrating rich, granular data streams into state-of-the-art ML frameworks. Moreover, the advanced predictive models emerging from these techniques can deliver not just point forecasts but also expected paths (e.g., capturing a "half-life" measure for the persistence of a signal) along with confidence levels. Such information can directly feed into a trade scaling model that adjusts position sizes based on forecast certainty and temporal decay.
+
+This project contributes substantively to the academic discourse on ML-driven discovery in financial markets, refining existing literature on high-frequency trading (HFT) and market microstructure. Improved predictive accuracy, combined with uncertainty quantification, can lead to economically meaningful outcomes—ranging from enhanced Sharpe ratios to minimized market impact—while also advancing theoretical understanding of price formation and order flow dynamics.
 
 **Selected Literature:**
 - Market Microstructure & Liquidity: Avellaneda, M. & Stoikov, S. (2008). "High-frequency trading in a limit order book." *Quantitative Finance, 8(3)*.
+- Deep Learning for Limit Order Books: Zhang, Z. & Zohren, S. (2021). "Multi-Horizon Forecasting for Limit Order Books: Novel Deep Learning Approaches and Hardware Acceleration Using Intelligent Processing Units." *arXiv:2108.05518*.
+- Deep Learning for Market by Order Data: Zhang, Z., Lima, B. & Zohren, S. (2021). "Deep Learning for Market by Order Data." *arXiv:2110.13767*.
 - Imbalanced Classification & Cohen’s Kappa: Cohen, J. (1960). "A coefficient of agreement for nominal scales." *Educational and Psychological Measurement, 20(1)*.
 - Sharpe Ratio & Risk Management: Lo, A. (2002). "The statistics of Sharpe ratios." *Financial Analysts Journal, 58(4)*.
 - Time Series Foundations: Shumway, R. & Stoffer, D. (2017). *Time Series Analysis and Its Applications.* Springer.
@@ -20,22 +23,22 @@ This work positions itself at the intersection of quantitative finance, economet
 ## Data Description and Preprocessing
 
 **Instruments and Period:**  
-The dataset encompasses 10 days of limit order book (LOB) and transaction-level data for seven highly liquid EGB futures contracts. The EGB futures market is characterized by granular high-frequency updates, thus providing a rich environment to investigate intraday price formation, volatility clustering, and inventory dynamics. The 10-day window, while relatively short, is chosen to reflect realistic research horizons in HFT contexts. Nonetheless, we will assess whether this period provides sufficient statistical power and potentially extend it as needed.
+The dataset encompasses 10 days of limit order book (LOB) and transaction-level data for seven highly liquid EGB futures contracts. The EGB futures market, with its high frequency and granularity, provides a fertile environment for modeling intraday price formation, volatility clustering, and inventory dynamics. While a 10-day window is relatively short, it reflects typical research horizons in HFT contexts and may be extended as needed based on initial results.
 
 **Order Data:**  
-The raw dataset consists of order messages (add, modify, delete) with precise timestamps, instrument identifiers, directions (buy/sell), prices, and quantities. Ensuring data integrity involves:  
+The raw dataset consists of messages (add, modify, delete) with precise timestamps, instrument identifiers, directions, prices, and quantities. Key steps include:  
 - **Timestamp Alignment:** Synchronizing event arrival times across instruments to handle latency distortions.  
-- **Data Cleaning & Robust Statistics:** Employing interpolation, outlier detection via z-scores or IQR thresholds, and domain-specific filtering rules to mitigate erroneous data points or survivorship bias.  
-- **Ensuring Stationarity & Structural Consistency:** Preprocessing steps will verify that the extracted time windows reflect consistent trading environments, reducing the risk of structural breaks that may confound model training.
+- **Data Cleaning & Robust Statistics:** Employing outlier detection and filtering rules to remove erroneous points.  
+- **Ensuring Stationarity & Structural Consistency:** Carefully segmenting data into intervals that reflect stable trading environments, reducing the confounding effects of structural breaks.
 
 **Trade Data and Market Microstructure Signals:**  
-Executed trades, categorized by aggressive/passive liquidity provision, will be integrated to distinguish informed from uninformed flow. This integration helps identify patterns that are economically meaningful—such as the response of prices to inventory imbalances or market impact events—and frames the modeling problem within established microstructure theories.
+Integrating trades classified by aggressiveness and liquidity provision status helps distinguish informed from uninformed flow. Such enrichment grounds the analysis in established microstructure theory, aligning predictive modeling with economically meaningful patterns—such as inventory adjustments and the reaction to significant trades.
 
 **Level Updates:**  
-LOB snapshots capturing best bid/ask prices, quantities, and order counts at high frequency enable modeling short-term volatility and price discovery. Special attention will be paid to overlapping windows and non-overlapping validation schemes to mitigate information leakage. Rolling validation and walk-forward analysis ensure out-of-sample reliability.
+Regular LOB snapshots support the modeling of short-term volatility and price discovery. We will utilize rolling and walk-forward validation schemes to ensure out-of-sample rigor and mitigate information leakage.
 
-**Strategies for Data Imbalance:**  
-As imbalances between trivial signals and meaningful trading opportunities are common, we will employ techniques such as SMOTE, cost-sensitive learning, and custom loss functions. Confidence intervals will support the statistical validity of results. We will also consider the economic value of signals, ensuring that predictive improvements translate into better execution quality or hedging performance.
+**Addressing Data Imbalance:**  
+SMOTE (Synthetic Minority Over-sampling Technique) will be considered to mitigate class imbalance by creating synthetic samples of the minority class. This and other strategies (e.g., cost-sensitive learning) help ensure robust model performance across different market regimes.
 
 **Selected Literature:**
 - Market Microstructure: Hasbrouck, J. (2007). *Empirical Market Microstructure.* Oxford University Press.
@@ -45,27 +48,20 @@ As imbalances between trivial signals and meaningful trading opportunities are c
 
 ## Advanced Feature Extraction
 
-The complexity of high-frequency financial data calls for novel feature extraction methods that capture non-linear dynamics, stochastic volatility, and evolving interaction patterns between orders and trades.
-
 **Temporal Definitions and Scaling:**  
-Time can be defined at microsecond granularity, event-based intervals, or equilibrium-driven chunks of data. Each representation has theoretical implications:  
-- **Microsecond-Level Analysis:** Captures ultra-high-frequency dynamics but may overfit transient noise.  
-- **Event-Based Chunks:** Aligns model inputs with meaningful state changes and price transitions, potentially better reflecting market equilibria.
+Time can be defined at microsecond resolution, event-based intervals, or equilibrium-driven chunks. Each representation has implications for model complexity and interpretability. Event-based segmentation may better capture relevant state changes, while ultra-high-frequency timestamps offer fine detail at the risk of modeling noise.
 
 **Path Signatures:**  
-Rooted in stochastic analysis, path signatures decompose data streams into a series expansion capturing non-linear dependencies and higher-order correlations (Lyons, T. 2014). By applying path signatures, we expect to encapsulate intricate order flow patterns more faithfully than simpler statistical aggregates.
+Path signatures (Lyons, 2014) capture higher-order correlations and non-linear dependencies in streams of order flow. Applying them to LOB data may uncover intricate structural patterns otherwise missed by simpler aggregates.
 
 **Matrix Motifs & Dynamic Time Warping (DTW):**  
-Matrix motifs identify recurring local submatrix patterns in LOB dynamics, while DTW aligns comparable time series segments that differ in speed or phase. Both offer sophisticated pattern recognition capabilities suited to detecting structural regimes and shifts that simpler metrics may miss.
+By identifying recurring local patterns (motifs) and aligning comparable time series segments via DTW, we can detect structural regimes and shifts in liquidity or order flow.
 
-**Dimensionality Reduction:**  
-To manage high-dimensional data, we will explore UMAP and tensor trains in addition to PCA and other classical factorization methods. UMAP effectively captures non-linear manifolds in the data, preserving local and global structure, while tensor trains offer a compressible representation of large datasets. These methods help identify lower-dimensional embeddings that highlight key latent factors in market behavior.
+**Dimensionality Reduction & Representation Learning:**  
+UMAP and tensor trains, alongside classical PCA, help reduce the complexity of large data, revealing latent factors that drive market dynamics. Time2Vec encodes time more naturally, allowing models to learn temporal patterns without arbitrary binning.
 
-**Time2Vec and Other Representations:**  
-Time2Vec encodes time into continuous feature vectors, enabling models to learn temporal patterns rather than relying on arbitrary time binning, helping capture periodicities and seasonality.
-
-**Feature Selection and Interpretability:**  
-Methods such as SHAP or permutation importance will assess each feature’s contribution, ensuring that the chosen representations yield economically interpretable and robust signals.
+**Feature Selection & Interpretability:**  
+SHAP values or permutation importance will reveal which features contribute most to predictive performance, ensuring that modeling choices translate into economically interpretable insights.
 
 **Selected Literature:**
 - Feature Extraction: Fulcher, B. D. & Jones, N. S. (2017). "hctsa: A Computational Framework for Automated Time-Series Phenotype Characterization." *Journal of Open Research Software*.
@@ -76,47 +72,49 @@ Methods such as SHAP or permutation importance will assess each feature’s cont
 ## Modeling Approaches
 
 **Classical Econometric Methods:**  
-- **GARCH Models:** Provide volatility forecasts that inform hedge ratios, grounded in established econometric theory.  
-- **Dimensionality Reduction (PCA, UMAP, Tensor Trains):** Extract principal components or embedded manifolds representing dominant factors in price movements and liquidity. While these methods may miss some non-linear patterns, they serve as effective baselines and facilitate understanding of underlying structure.
+- **GARCH Models:** Provide volatility forecasts and inform hedge ratios.
+- **Dimensionality Reduction (PCA, UMAP, Tensor Trains):** Extract dominant factors underlying price movements, serving as strong baselines for comparison with more complex models.
 
-**Markov Chains & Neural Networks for Order Arrival Distributions:**  
-Previous research has found Markov chains to be powerful models for capturing the distribution of order arrivals. When compared with neural networks, Markov chains have demonstrated strong explanatory power, offering a reliable baseline. Leveraging this experience, we now seek to enhance these capabilities with Mamba—an architecture well-suited for complex, multi-agent interactions—potentially capturing richer dynamics in order arrivals.
+**Markov Chains as Baselines:**  
+Previously, Markov chains were shown to be effective for modeling order arrival distributions, providing a strong explanatory baseline. Their success motivates our push toward more sophisticated, context-aware approaches.
 
 **Modern Statistical & ML Toolkits:**  
-- **TSA, Aeon, sktime, Nixtla, PyTorch Forecasting, Darts, Merlion:** Rapid prototyping frameworks that facilitate the exploration of various forecasting and anomaly detection models.
-- **uniTs (Multi-task Time Series Modeling):** Enables simultaneous forecasting of multiple targets, leveraging cross-instrument correlations and cointegrated relationships.
+Frameworks such as TSA, Aeon, sktime, Nixtla, PyTorch Forecasting, Darts, and Merlion enable rapid prototyping of forecasting and anomaly detection models. Tools like uniTs support multi-task time series modeling across multiple instruments.
 
 **Cutting-Edge Architectures:**
-- **Transformers & Mamba Integration:** Transformers, including Informer and Autoformer architectures, excel at modeling long-range dependencies and expanding the contextual window within a restricted order vocabulary. By integrating Mamba—a model designed to handle complex interaction patterns—and Transformers, we anticipate a significant enhancement in capturing nuanced microstructure signals and regime shifts.  
-- **Foundation Models & Graph Neural Networks (TimeGPT):** By modeling relational structures and capitalizing on large-scale pretraining, these approaches can uncover emergent patterns not visible through standard analyses, representing a frontier in time series modeling.
+- **Transformers & Mamba Integration:** Transformers (including Informer and Autoformer) handle long-range dependencies efficiently, and integrating them with Mamba can capture complex multi-agent interactions in the LOB. This combination extends beyond what Markov chains can achieve, modeling more nuanced structure and longer contextual horizons.  
+- **Foundation Models & Graph Neural Networks (TimeGPT):** Exploit relational structures and large-scale pretraining to discover emergent patterns. Such architectures can handle increasingly complex datasets and diverse state representations.
+
+**Capturing the Expected Path and Confidence Levels:**  
+Building on models like those presented by Zhang and Zohren (2021) and Zhang, Lima, and Zohren (2021), we aim to generate forecasts that provide not only point predictions but also an expected path over time horizons (e.g., identifying signal half-lives). In addition, confidence intervals or predictive distributions can inform a trade scaling model, where position sizes are adjusted based on predicted signal persistence and certainty.
 
 **Hyperparameter Optimization & Model Selection:**  
-Bayesian optimization or evolutionary strategies will be employed for hyperparameter tuning, ensuring a rigorous search over model configurations. This systematic approach respects the financial domain constraints and the non-stationary nature of the data.
+Bayesian optimization and evolutionary strategies will be used to fine-tune models, ensuring that final solutions respect non-stationarity and domain constraints.
 
 ---
 
 ## Evaluation Metrics, Validation, and Statistical Rigor
 
-Evaluating model quality involves multiple layers:
+**Metrics and Methods:**  
+- **Predictive Accuracy & Reliability:** Metrics like Cohen’s Kappa and proper scoring rules will be used. Confidence intervals and prediction intervals assess statistical significance.
+- **Walk-Forward Validation:** Time-series splitting and walk-forward testing prevent look-ahead bias.
+- **Economic Metrics:** We will assess Sharpe ratios, turnover, and market impact to ensure that predictive gains translate into concrete financial improvements.
 
-- **Predictive Accuracy & Reliability:** Metrics like Cohen’s Kappa adjust for chance agreement and address label imbalance. Confidence and prediction intervals assess the statistical significance of predictions.  
-- **Walk-Forward Validation & Out-of-Sample Testing:** Time-series splitting and rolling validation mitigate look-ahead bias, ensuring that conclusions generalize beyond the training period.  
-- **Economic Metrics:** Simulated trading strategies will consider transaction costs, market impact, and slippage, ensuring that predictive gains translate into improved financial outcomes. Sharpe ratios, inventory turnover rates, and liquidity measures provide economically grounded benchmarks.
+**SMOTE One-Sentence Explanation:**  
+SMOTE is a technique that creates synthetic minority class samples to address class imbalance and improve model training outcomes.
 
 ---
 
 ## Conclusion and Broader Implications
 
-This project integrates theory-driven econometric approaches with data-driven ML techniques to understand and predict microstructure dynamics in the EGB futures market. By starting from Markov chains and classical econometric models and evolving toward Mamba, Transformers, and other advanced architectures, we create a structured research path that tests increasingly sophisticated hypotheses. Incorporating UMAP, tensor trains, and Time2Vec enriches the feature space, while a rigorous evaluation framework (walk-forward validation, economic metrics, interpretability methods) ensures results are robust and theoretically meaningful.
+This project integrates theory-driven econometrics with cutting-edge ML to understand and predict microstructure dynamics in the EGB futures market. By moving from Markov chains to advanced architectures like Mamba and Transformers, and by incorporating deep learning techniques shown effective in previous research on LOB and market-by-order data, we expand the complexity and nuance of our predictive models. The resulting forecasts include expected paths and confidence levels, providing practical inputs to trade scaling decisions.
 
-From an academic standpoint, this research informs the scholarly debate on market efficiency and the role of advanced ML in price discovery. Practically, it offers improved quoting strategies and hedging decisions, ultimately benefiting liquidity providers and other market participants. The integration of Mamba and Transformer-based architectures, building on our past work with Markov chains, represents a significant methodological expansion, allowing us to capture more complex dynamics and broader contextual windows in order behavior.
-
-We plan to maintain a transparent research pipeline, including code repositories, notebooks, and documentation to foster reproducibility. Future extensions may expand the time horizon, incorporate additional asset classes, or apply transfer learning techniques to new markets. This scalable, adaptive framework exemplifies a forward-looking approach to high-frequency financial research.
+Our rigorous evaluation framework, transparent research pipeline, and integration of advanced feature extraction techniques (UMAP, Time2Vec, path signatures) position this research as both academically and practically valuable. Over time, this framework can be extended to new asset classes, longer horizons, or cross-market generalization. Ultimately, the project contributes to a more efficient, informed, and adaptive approach to high-frequency financial research and trading strategy design.
 
 **Additional Selected Literature on Modern Methods:**
 - Li, S. et al. (2019). "Enhancing the Locality and Breaking the Memory Bottleneck of Transformer on Time Series Forecasting." *NeurIPS*.  
 - Zhou, H. et al. (2021). "Autoformer: Decomposition Transformers with Auto-Correlation for Long-Term Series Forecasting." *NeurIPS*.
-```
+
 
 
 
