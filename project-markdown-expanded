@@ -1,0 +1,264 @@
+Project Proposal: Advanced Machine Learning Techniques for High-Frequency Time Series Analysis in the European Bond Futures Market
+Executive Summary
+This project explores advanced machine learning (ML) and statistical methods to analyze high-frequency data in the European Government Bond (EGB) futures market. By integrating granular order data with level data, it seeks to predict not just point forecasts but full paths with confidence intervals, enabling better quoting, hedging, and inventory management strategies. Combining econometric models with state-of-the-art architectures like Transformers and Mamba, we aim to uncover latent patterns in market microstructure and enhance predictive accuracy, contributing to both academic literature and practical financial strategies for market making and hedging.
+Selected Literature:
+
+Avellaneda, M., & Stoikov, S. (2008). "High-frequency trading in a limit order book." Quantitative Finance, 8(3).
+Zhang, Z., & Zohren, S. (2021). "Multi-Horizon Forecasting for Limit Order Books: Novel Deep Learning Approaches and Hardware Acceleration Using Intelligent Processing Units." arXiv:2108.05518.
+Zhang, Z., Lima, B., & Zohren, S. (2021). "Deep Learning for Market by Order Data." arXiv:2110.13767.
+Cohen, J. (1960). "A coefficient of agreement for nominal scales." Educational and Psychological Measurement, 20(1).
+Lo, A. (2002). "The statistics of Sharpe ratios." Financial Analysts Journal, 58(4).
+Shumway, R., & Stoffer, D. (2017). Time Series Analysis and Its Applications. Springer.
+
+Data Description and Preprocessing
+Instruments and Period
+The dataset encompasses 10 days of limit order book (LOB) and transaction-level data for seven highly liquid EGB futures contracts. The EGB futures market, with its high frequency and granularity, provides a fertile environment for modeling intraday price formation, volatility clustering, and inventory dynamics. While a 10-day window is relatively short, it reflects typical research horizons in HFT contexts and may be extended as needed based on initial results.
+Order and Level Data Integration
+Integrating granular order and level data is central to this project. Order messages (add, modify, delete) are synchronized with LOB snapshots to analyze short-term volatility, price discovery, and market reactions. Key steps include:
+
+Timestamp Alignment: Synchronizing event arrival times across instruments to handle latency distortions.
+Data Cleaning & Robust Statistics:
+
+Employing outlier detection
+Implementing filtering rules to remove erroneous points
+
+
+Ensuring Stationarity & Structural Consistency:
+
+Carefully segmenting data into intervals that reflect stable trading environments
+Reducing the confounding effects of structural breaks
+
+
+
+Trade Data and Market Microstructure Signals
+Integrating trades classified by aggressiveness and liquidity provision status helps distinguish informed from uninformed flow. Such enrichment grounds the analysis in established microstructure theory, aligning predictive modeling with economically meaningful patterns—such as inventory adjustments and the reaction to significant trades.
+Addressing Data Imbalance
+SMOTE (Synthetic Minority Over-sampling Technique) will be considered to mitigate class imbalance by creating synthetic samples of the minority class. This and other strategies (e.g., cost-sensitive learning) help ensure robust model performance across different market regimes.
+Selected Literature:
+
+Hasbrouck, J. (2007). Empirical Market Microstructure. Oxford University Press.
+Johansen, S. (1988). "Statistical analysis of cointegration vectors." Journal of Economic Dynamics and Control, 12(2–3).
+Cont, R. (2001). "Empirical properties of asset returns: Stylized facts and statistical issues." Quantitative Finance, 1(2).
+
+Advanced Feature Extraction
+Time Representation
+Time can be defined at:
+
+Microsecond resolution
+Event-based intervals
+Equilibrium-driven chunks
+
+Each representation has implications for model complexity and interpretability. Event-based segmentation may better capture relevant state changes, while ultra-high-frequency timestamps offer fine detail at the risk of modeling noise.
+Advanced Feature Extraction Methods
+
+Path Signatures:
+
+Capture higher-order correlations and non-linear dependencies in streams of order flow
+Potentially uncover intricate structural patterns missed by simpler aggregates
+
+
+Matrix Motifs & Dynamic Time Warping (DTW):
+
+Identify recurring local patterns (motifs)
+Align comparable time series segments
+Detect structural regimes and shifts in liquidity or order flow
+
+
+Dimensionality Reduction & Representation Learning:
+
+UMAP and tensor trains
+Classical PCA
+Reduce complexity of large data
+Reveal latent factors driving market dynamics
+Unique Opportunity: For researchers with a physics background, tensor trains offer unexplored opportunities to apply techniques from quantum physics to time series analysis
+Time2Vec: Encodes time more naturally, allowing models to learn temporal patterns without arbitrary binning
+
+
+Feature Selection & Interpretability:
+
+SHAP values or permutation importance
+Reveal features contributing most to predictive performance
+Ensure modeling choices translate into economically interpretable insights
+
+
+
+Selected Literature:
+
+Fulcher, B. D., & Jones, N. S. (2017). "hctsa: A Computational Framework for Automated Time-Series Phenotype Characterization." Journal of Open Research Software.
+Wu, Y., et al. (2021). "Graph Neural Networks: A Review of Methods and Applications." AI Open.
+Cichocki, A., & Zdunek, R. (2016). "Tensor decomposition methods for signal processing applications." IEEE Transactions on Signal Processing, 64(10).
+
+Modeling Approaches
+This section explores the integration of classical econometric methods and cutting-edge machine learning architectures to tackle challenges in time series forecasting, volatility modeling, and high-frequency financial data analysis.
+Foundational Approaches
+
+Traditional Methods: Serve as robust baselines for understanding market dynamics
+Modern Statistical Toolkits: Enable rapid prototyping and model experimentation
+
+TSA
+PyTorch Forecasting
+Darts
+
+
+
+Detailed Modeling Strategy
+Classical Econometric Methods:
+
+GARCH Models: Provide volatility forecasts and inform hedge ratios
+Dimensionality Reduction:
+
+PCA
+UMAP
+Tensor Trains
+
+
+Extract dominant factors underlying price movements
+Serve as strong baselines for comparison
+
+Markov Chains
+Previously demonstrated effectiveness in modeling order arrival distributions, providing a strong explanatory baseline. This success motivates our push toward more sophisticated, context-aware approaches.
+Modern Statistical & ML Toolkits
+Frameworks enabling advanced modeling:
+
+TSA
+Aeon
+sktime
+Nixtla
+PyTorch Forecasting
+Darts
+Merlion
+uniTs (supports multi-task time series modeling)
+
+Cutting-Edge Architectures
+
+Transformers & Mamba Integration:
+
+Handle long-range dependencies efficiently
+Capture complex multi-agent interactions in the Limit Order Book (LOB)
+Extend beyond Markov chains
+Model more nuanced structures and longer contextual horizons
+
+
+Foundation Models & Graph Neural Networks:
+
+TimeGPT
+Exploit relational structures
+Leverage large-scale pretraining
+Discover emergent patterns
+Handle increasingly complex datasets
+
+
+Liquid Neural Networks:
+
+Adaptive neural architectures
+Capable of continuous learning
+Dynamically adjust based on incoming data
+Efficiently model complex, time-evolving patterns
+Particularly suitable for high-frequency financial data
+
+
+
+Forecasting Capabilities
+Building on previous research, aim to generate forecasts that:
+
+Provide point predictions
+Outline expected paths over time horizons
+Identify signal half-lives
+Generate confidence intervals
+Create predictive distributions
+
+Model Optimization
+
+Hyperparameter Tuning:
+
+Bayesian optimization
+Evolutionary strategies
+
+
+Ensure solutions respect non-stationarity and domain constraints
+
+Selected Literature:
+
+Zhang, Z., & Zohren, S. (2021). "Multi-Horizon Forecasting for Limit Order Books"
+Zhou, H., et al. (2021). "Autoformer: Decomposition Transformers with Auto-Correlation for Long-Term Series Forecasting"
+Wooldridge, M. (2009). "An Introduction to MultiAgent Systems"
+Hasani, R., et al. (2020). "Liquid Time-Constant Networks"
+Ekambaram et al. (2024). "Tiny Time Mixers (TTMs)"
+Baczek et al. (2024). "TSPP: A Unified Benchmarking Tool for Time-series Forecasting"
+
+Evaluation Metrics, Validation, and Statistical Rigor
+Comprehensive Evaluation Framework
+Metrics and methods provide a critical foundation for evaluating:
+
+Robustness
+Accuracy
+Practical impact of predictive models
+
+Goal: Ensure models perform well on historical data and translate into actionable insights in real-world financial scenarios.
+Detailed Evaluation Approach
+
+Predictive Accuracy & Reliability:
+
+Cohen's Kappa
+Proper scoring rules
+Confidence intervals
+Prediction intervals
+Assess statistical significance
+
+
+Validation Techniques:
+
+Walk-forward validation
+Time-series splitting
+Prevent look-ahead bias
+
+
+Economic Performance Indicators:
+
+Sharpe ratios
+Trading turnover
+Market impact analysis
+
+
+
+Selected Literature:
+
+Hyndman, R. J., & Athanasopoulos, G. (2018). Forecasting: Principles and Practice
+Lo, A. (2002). "The statistics of Sharpe ratios"
+Bergmeir, C., Hyndman, R. J., & Koo, B. (2018). "A note on the validity of cross-validation for evaluating time series prediction"
+
+Conclusion and Broader Implications
+Research Integration
+
+Theory-driven econometrics
+Cutting-edge machine learning
+Advanced feature extraction techniques
+
+Key Contributions
+
+Enhanced understanding of market microstructure dynamics
+More nuanced predictive models for EGB futures market
+Expanded complexity and predictive capabilities
+
+Future Potential
+Framework can be extended to:
+
+New asset classes
+Longer time horizons
+Cross-market generalization
+
+Final Perspective
+By moving beyond traditional Markov chains to advanced architectures like Mamba and Transformers, this research expands the complexity and nuance of predictive models. The resulting forecasts include expected paths and confidence levels, providing practical inputs for:
+
+Market making
+Hedging strategies
+Inventory scaling decisions
+
+Additional Selected Literature
+
+Li, S., et al. (2019). "Enhancing the Locality and Breaking the Memory Bottleneck of Transformer on Time Series Forecasting"
+Zhou, H., et al. (2021). "Autoformer: Decomposition Transformers with Auto-Correlation for Long-Term Series Forecasting"
+Lyons, T. (2014). Rough paths: Theory and applications
+Cyranka, J., & Haponiuk, S. (2024). "Unified Long-Term Time-Series Forecasting Benchmark"
+Ma, Q., et al. (2024). "A Survey on Time-Series Pre-Trained Models"
+Krymski, A., & Bilokon, P. (2024). "Representation Learning for Financial Time Series Forecasting"
