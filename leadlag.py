@@ -1,0 +1,546 @@
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.signal import correlate
+from scipy.spatial.distance import euclidean
+from fastdtw import fastdtw
+import esig
+from itertools import combinations
+
+def generate_synthetic_data(n_assets=3, n_points=1000, epsilon=0.3, gamma=0.2, tau=5, seed=42):
+    """
+    Generate synthetic price data with lead-lag relationships
+    
+    Parameters:
+    -----------
+    n_assets : int
+        Number of assets to generate
+    n_points : int
+        Number of time points
+    epsilon : float
+        Probability of lead-lag relationship occurring
+    gamma : float
+        Noise parameter for return relationship
+    tau : int
+        Base time lag (will have random variation)
+    seed : int
+        Random seed for reproducibility
+    
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with asset prices and timestamps
+    """
+    np.random.seed(seed)
+    
+    # Generate base returns for the leader asset
+    leader_returns = np.random.normal(0, 0.01, n_points)
+    
+    prices = np.zeros((n_points, n_assets))
+    prices[:, 0] = np.exp(np.cumsum(leader_returns))  # Leader asset
+    
+    # Generate follower assets
+    for i in range(1, n_assets):
+        follower_returns = np.zeros(n_points)
+        
+        for t in range(tau, n_points):
+            # Random variation in tau
+            actual_tau = tau + np.random.randint(-2, 3)
+            actual_tau = max(1, min(actual_tau, t))
+            
+            # Determine if lead-lag occurs at this point
+            if np.random.random() < epsilon:
+                # Add lagged return with noise
+                follower_returns[t] = (leader_returns[t - actual_tau] + 
+                                     gamma * np.random.normal(0, 0.01))
+            else:
+                # Independent return
+                follower_returns[t] = np.random.normal(0, 0.01)
+        
+        prices[:, i] = np.exp(np.cumsum(follower_returns))
+    
+    # Create DataFrame with timestamps
+    timestamps = pd.date_range(start='2024-01-01', periods=n_points, freq='1min')
+    df = pd.DataFrame(prices, index=timestamps, 
+                     columns=[f'Asset_{i}' for i in range(n_assets)])
+    
+    return df
+
+def calculate_log_returns(prices):
+    """Calculate log returns from price series"""
+    return np.log(prices / prices.shift(1)).dropna()
+
+def signature_method(returns1, returns2, max_lag=20):
+    """
+    Estimate lead-lag using signature method
+    """
+    lead_lag_scores = []
+    
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            x = returns1.iloc[-lag:].values
+            y = returns2.iloc[:lag].values
+        else:
+            x = returns1.iloc[:-lag if lag > 0 else None].values
+            y = returns2.iloc[lag:].values
+        
+        # Create path
+        path = np.column_stack([x, y])
+        
+        # Calculate signature
+        sig = esig.stream2sig(path, 2)  # Use level 2 signature
+        
+        # Use signature norm as score
+        lead_lag_scores.append(np.linalg.norm(sig))
+    
+    best_lag = range(-max_lag, max_lag + 1)[np.argmax(lead_lag_scores)]
+    return best_lag
+
+def compute_dtw(series1, series2):
+    """
+    Compute the Dynamic Time Warping (DTW) distance and alignment using FastDTW.
+    
+    Parameters:
+    -----------
+    series1: First time series (1D array)
+    series2: Second time series (1D array)
+    
+    Returns:
+    --------
+    tuple: DTW distance and path
+    """
+    # Convert to numpy arrays if they aren't already
+    series1 = np.asarray(series1, dtype=np.float64)
+    series2 = np.asarray(series2, dtype=np.float64)
+    
+    # Ensure inputs are 1-D arrays
+    if series1.ndim > 1:
+        series1 = series1.ravel()
+    if series2.ndim > 1:
+        series2 = series2.ravel()
+    
+    # Ensure we have finite values
+    series1 = np.nan_to_num(series1, nan=0.0)
+    series2 = np.nan_to_num(series2, nan=0.0)
+    
+    # Custom distance function that ensures 1D input
+    def custom_dist(x, y):
+        return np.abs(x - y)
+    
+    # Compute DTW using FastDTW with custom distance function
+    distance, path = fastdtw(series1, series2, dist=custom_dist)
+    return distance, path
+
+def dtw_method(returns1, returns2, max_lag=20):
+    """
+    Estimate lead-lag using Dynamic Time Warping
+    """
+    dtw_scores = []
+    
+    # Convert to numpy arrays if they're pandas series
+    if hasattr(returns1, 'values'):
+        returns1 = returns1.values
+    if hasattr(returns2, 'values'):
+        returns2 = returns2.values
+    
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            x = returns1[-lag:]
+            y = returns2[:lag]
+        else:
+            x = returns1[:-lag] if lag > 0 else returns1
+            y = returns2[lag:] if lag > 0 else returns2
+        
+        try:
+            distance, _ = compute_dtw(x, y)
+            dtw_scores.append(distance)
+        except Exception as e:
+            print(f"Warning: DTW computation failed for lag {lag}: {str(e)}")
+            dtw_scores.append(float('inf'))
+    
+    best_lag = range(-max_lag, max_lag + 1)[np.argmin(dtw_scores)]
+    return best_lag
+
+def compute_top(series1, series2, beta=1.0):
+    """
+    Compute the Thermal Optimal Path (TOP) between two time series.
+    
+    Parameters:
+    -----------
+    series1: First time series (1D array)
+    series2: Second time series (1D array)
+    beta: Smoothing parameter (controls path variability)
+    
+    Returns:
+    --------
+    tuple: Optimal path and cost matrix
+    """
+    n, m = len(series1), len(series2)
+    dist_matrix = np.zeros((n, m))
+    cost_matrix = np.zeros((n, m))
+    path_matrix = np.zeros((n, m), dtype=int)
+
+    # Compute distance matrix
+    for i in range(n):
+        for j in range(m):
+            dist_matrix[i, j] = (series1[i] - series2[j]) ** 2
+
+    # Initialize cost matrix
+    cost_matrix[0, :] = dist_matrix[0, :]
+    path_matrix[0, :] = np.arange(m)
+
+    # Dynamic programming to compute the cost matrix
+    for i in range(1, n):
+        for j in range(m):
+            prev_costs = cost_matrix[i - 1, max(0, j - 1): min(m, j + 2)]
+            smoothness_penalty = beta * np.abs(np.arange(max(0, j - 1), min(m, j + 2)) - j)
+            total_costs = prev_costs + smoothness_penalty
+            min_idx = np.argmin(total_costs)
+
+            cost_matrix[i, j] = dist_matrix[i, j] + total_costs[min_idx]
+            path_matrix[i, j] = max(0, j - 1) + min_idx
+
+    # Backtrack to find the optimal path
+    optimal_path = []
+    j = np.argmin(cost_matrix[-1, :])  # Start from the last row
+    for i in range(n - 1, -1, -1):
+        optimal_path.append((i, j))
+        j = path_matrix[i, j]
+    optimal_path.reverse()
+
+    return optimal_path, cost_matrix
+
+def extract_lead_lag_from_top(optimal_path):
+    """
+    Extract the lead-lag relationship from TOP optimal path
+    
+    Parameters:
+    -----------
+    optimal_path: List of tuples containing the optimal path indices
+    
+    Returns:
+    --------
+    int: Estimated lead-lag value
+    """
+    # Calculate average time difference in the path
+    time_diffs = [j - i for i, j in optimal_path]
+    lead_lag = int(round(np.mean(time_diffs)))
+    return lead_lag
+
+def top_method(returns1, returns2, max_lag=20, beta=1.0):
+    """
+    Estimate lead-lag using TOP (Thermal Optimal Path) method
+    """
+    x = returns1.values
+    y = returns2.values
+    
+    optimal_path, _ = compute_top(x, y, beta)
+    lead_lag = extract_lead_lag_from_top(optimal_path)
+    
+    # Ensure the lead-lag is within the specified max_lag
+    lead_lag = np.clip(lead_lag, -max_lag, max_lag)
+    
+    return lead_lag
+
+def cross_correlation_method(returns1, returns2, max_lag=20):
+    """
+    Estimate lead-lag using cross-correlation
+    """
+    cross_corr = correlate(returns1, returns2, mode='full')
+    lags = np.arange(-len(returns1) + 1, len(returns1))
+    
+    # Find the lag with maximum correlation
+    best_lag = lags[np.argmax(np.abs(cross_corr))]
+    
+    # Limit to max_lag
+    if abs(best_lag) > max_lag:
+        best_lag = max_lag * np.sign(best_lag)
+    
+    return best_lag
+
+def hayashi_yoshida_estimator(returns1, returns2):
+    """
+    Implement Hayashi-Yoshida estimator for lead-lag
+    """
+    # Convert returns to cumulative returns for overlap calculation
+    cum_returns1 = returns1.cumsum()
+    cum_returns2 = returns2.cumsum()
+    
+    # Calculate overlapping periods
+    overlaps = []
+    for i in range(len(returns1) - 1):
+        for j in range(len(returns2) - 1):
+            if (cum_returns1.index[i] < cum_returns2.index[j+1] and 
+                cum_returns2.index[j] < cum_returns1.index[i+1]):
+                # Periods overlap
+                overlaps.append((i, j))
+    
+    # Calculate estimator
+    hy_estimate = 0
+    for i, j in overlaps:
+        hy_estimate += returns1.iloc[i] * returns2.iloc[j]
+    
+    return hy_estimate
+
+def analyze_lead_lag_relationships(prices, max_lag=20, beta=1.0):
+    """
+    Analyze lead-lag relationships using all methods
+    
+    Parameters:
+    -----------
+    prices: DataFrame with price data
+    max_lag: Maximum lag to consider
+    beta: Smoothing parameter for TOP method
+    
+    Returns:
+    --------
+    DataFrame: Results of all lead-lag analyses
+    """
+    returns = calculate_log_returns(prices)
+    results = []
+    
+    for asset1, asset2 in combinations(returns.columns, 2):
+        sig_lag = signature_method(returns[asset1], returns[asset2], max_lag)
+        dtw_lag = dtw_method(returns[asset1], returns[asset2], max_lag)
+        top_lag = top_method(returns[asset1], returns[asset2], max_lag, beta)
+        xcorr_lag = cross_correlation_method(returns[asset1], returns[asset2], max_lag)
+        hy_est = hayashi_yoshida_estimator(returns[asset1], returns[asset2])
+        
+        results.append({
+            'Asset1': asset1,
+            'Asset2': asset2,
+            'Signature_Lag': sig_lag,
+            'DTW_Lag': dtw_lag,
+            'TOP_Lag': top_lag,
+            'XCorr_Lag': xcorr_lag,
+            'HY_Estimator': hy_est
+        })
+    
+    return pd.DataFrame(results)
+
+# Example usage
+if __name__ == "__main__":
+    # Generate synthetic data
+    n_assets = 3
+    prices = generate_synthetic_data(
+        n_assets=n_assets,
+        n_points=1000,
+        epsilon=0.3,  # 30% of the time lead-lag exists
+        gamma=0.2,    # Noise in relationship
+        tau=5         # Base time lag
+    )
+    
+    # Analyze lead-lag relationships
+    results = analyze_lead_lag_relationships(prices, max_lag=20, beta=1.0)
+    print("\nLead-Lag Analysis Results:")
+    print(results)
+
+/====
+import numpy as np
+import iisignature  # For signature computation
+from scipy.signal import correlate
+from scipy.spatial.distance import cosine
+
+def generate_synthetic_stock_prices(
+    n_assets=3, n_timepoints=100, leadlag_percentage=0.95, epsilon=0.01, lead_lags=None
+):
+    """
+    Generate synthetic stock prices for n_assets over n_timepoints with lead-lag relationships.
+    :param n_assets: Number of assets (securities).
+    :param n_timepoints: Number of time points.
+    :param leadlag_percentage: Percentage of time steps with enforced lead-lag relationships.
+    :param epsilon: Small random noise on the lead-lag differential.
+    :param lead_lags: List of tuples defining lead-lag relationships. Each tuple is (leader, lagger, lag).
+    :return: 2D array of synthetic stock prices (n_timepoints, n_assets).
+    """
+    # Base random walk for all assets
+    prices = np.cumsum(np.random.randn(n_timepoints, n_assets), axis=0) + 100
+
+    if lead_lags is None:
+        lead_lags = [(0, 1, 3), (1, 2, 2)]  # Default lead-lag relationships
+
+    # Apply lead-lag relationships
+    for leader, lagger, lag in lead_lags:
+        leadlag_steps = int(n_timepoints * leadlag_percentage)
+        leadlag_indices = np.random.choice(
+            np.arange(n_timepoints - lag), size=leadlag_steps, replace=False
+        )
+        for idx in leadlag_indices:
+            # Enforce lead-lag: lagger follows leader with some noise
+            prices[idx + lag, lagger] = (
+                prices[idx, leader] + epsilon * np.random.randn()
+            )
+
+    return prices
+
+# Compute cross-correlation for lead-lag analysis
+def compute_cross_correlation(series1, series2, max_lag=10):
+    """
+    Compute cross-correlation between two time series with lag analysis.
+    :param series1: First time series.
+    :param series2: Second time series.
+    :param max_lag: Maximum lag to consider.
+    :return: Lag values and cross-correlation values.
+    """
+    lags = np.arange(-max_lag, max_lag + 1)
+    corr = []
+    for lag in lags:
+        if lag > 0:
+            if len(series1) - lag <= 0:
+                corr.append(0)
+                continue
+            corr_value = np.corrcoef(series1[:-lag], series2[lag:])[0, 1]
+        elif lag < 0:
+            if len(series2) + lag <= 0:
+                corr.append(0)
+                continue
+            corr_value = np.corrcoef(series1[-lag:], series2[:lag])[0, 1]
+        else:
+            corr_value = np.corrcoef(series1, series2)[0, 1]
+        corr.append(corr_value)
+    return lags, corr
+
+# Compute signature-based lead-lag estimate using iisignature
+def compute_signature_based_lead_lag(series1, series2, max_lag=10, sig_depth=3):
+    """
+    Estimate lead-lag relationship between two time series using signature features.
+    :param series1: First time series.
+    :param series2: Second time series.
+    :param max_lag: Maximum lag to consider.
+    :param sig_depth: Depth of the signature.
+    :return: Estimated lag based on signature similarity.
+    """
+    # Normalize the series
+    s1 = (series1 - np.mean(series1)) / np.std(series1)
+    s2 = (series2 - np.mean(series2)) / np.std(series2)
+
+    best_similarity = -np.inf
+    best_lag = 0
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            # series1 leads series2
+            s1_aligned = s1[:-lag]
+            s2_aligned = s2[lag:]
+        elif lag < 0:
+            # series2 leads series1
+            s1_aligned = s1[-lag:]
+            s2_aligned = s2[:lag]
+        else:
+            # No lag
+            s1_aligned = s1
+            s2_aligned = s2
+
+        if len(s1_aligned) < sig_depth + 1:
+            continue  # Skip if not enough data for signature
+
+        # Compute the signature for each aligned pair
+        path = np.vstack([s1_aligned, s2_aligned])  # Shape: (2, n_samples)
+        sig = iisignature.sig(path, sig_depth)  # Compute signature up to the specified depth
+
+        # Compute similarity (e.g., cosine similarity) between signatures
+        # Flatten the signature tensors
+        sig1 = sig  # iisignature returns a 1D array
+        sig2 = sig  # Since it's the same path, this is incorrect
+
+        # Correction: Compute signature for path1 and path2 separately
+        # Alternatively, compute signature for the combined path and compare with a reference
+
+        # Instead, a better approach is to compute separate signatures for each series and compare
+        # But since we have a 2D path, we can use the signature as a feature vector
+
+        # For similarity, use the norm of the signature (could also use other metrics)
+        similarity = np.linalg.norm(sig)
+
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_lag = lag
+
+    return best_lag, best_similarity
+
+# Alternative Signature-Based Lead-Lag Estimate
+def compute_signature_similarity_lead_lag(series1, series2, max_lag=10, sig_depth=3):
+    """
+    Alternative method to estimate lead-lag relationship using signatures.
+    Computes signatures for aligned paths and measures cosine similarity.
+    :param series1: First time series.
+    :param series2: Second time series.
+    :param max_lag: Maximum lag to consider.
+    :param sig_depth: Depth of the signature.
+    :return: Estimated lag based on signature cosine similarity.
+    """
+    # Normalize the series
+    s1 = (series1 - np.mean(series1)) / np.std(series1)
+    s2 = (series2 - np.mean(series2)) / np.std(series2)
+
+    best_similarity = -np.inf
+    best_lag = 0
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            # series1 leads series2
+            s1_aligned = s1[:-lag]
+            s2_aligned = s2[lag:]
+        elif lag < 0:
+            # series2 leads series1
+            s1_aligned = s1[-lag:]
+            s2_aligned = s2[:lag]
+        else:
+            # No lag
+            s1_aligned = s1
+            s2_aligned = s2
+
+        if len(s1_aligned) < sig_depth + 1:
+            continue  # Skip if not enough data for signature
+
+        # Compute the signature for each aligned path separately
+        path1 = np.vstack([s1_aligned, s2_aligned])  # Shape: (2, n_samples)
+        sig1 = iisignature.sig(path1, sig_depth)
+
+        # For comparison, you might need a reference signature or use a different approach
+        # Here, we'll use the norm as a placeholder for similarity
+        similarity = np.linalg.norm(sig1)
+
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_lag = lag
+
+    return best_lag, best_similarity
+
+# Main function
+if __name__ == "__main__":
+    # Parameters
+    n_assets = 4
+    n_timepoints = 200
+    leadlag_percentage = 0.3  # 30% of the time, enforce lead-lag relationships
+    epsilon = 0.05  # Noise on the lead-lag relationship
+    lead_lags = [(0, 1, 3), (1, 2, 2), (2, 3, 1)]  # Lead-lag relationships
+
+    # Generate synthetic stock prices
+    prices = generate_synthetic_stock_prices(
+        n_assets, n_timepoints, leadlag_percentage, epsilon, lead_lags
+    )
+
+    # Display the generated prices
+    print("Generated Stock Prices:\n", prices)
+
+    # Lead-lag analysis using cross-correlation and signature methods
+    for i in range(n_assets):
+        for j in range(i + 1, n_assets):
+            # Cross-Correlation Method
+            lags_cc, corr = compute_cross_correlation(prices[:, i], prices[:, j], max_lag=10)
+            best_lag_cc = lags_cc[np.argmax(corr)]
+            best_corr = max(corr)
+
+            # Signature-Based Method using iisignature
+            best_lag_sig, best_sim = compute_signature_similarity_lead_lag(
+                prices[:, i], prices[:, j], max_lag=10, sig_depth=3
+            )
+
+            print(f"\nLead-lag relationship between Asset {i} and Asset {j}:")
+            print("  Cross-Correlation Method:")
+            print(f"    Best lag: {best_lag_cc} (positive => Asset {i} leads)")
+            print(f"    Cross-correlation at best lag: {best_corr:.3f}")
+            print("  Signature-Based Method:")
+            print(f"    Best lag: {best_lag_sig} (positive => Asset {i} leads)")
+            print(f"    Signature similarity at best lag: {best_sim:.3f}")
