@@ -696,3 +696,45 @@ if __name__ == "__main__":
     results_df = pd.DataFrame(results)
     print(results_df)
     
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import correlate
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
+
+def generate_asynchronous_log_returns(
+    n_points=200, n_assets=3, lead_lags=None, noise_level=0.01, gamma=2
+):
+    """
+    Generate asynchronous log returns data with lead-lag relationships and noise.
+    :param n_points: Number of total points per asset.
+    :param n_assets: Number of assets.
+    :param lead_lags: List of tuples specifying (leader, lagger, lag).
+    :param noise_level: Noise level in the data.
+    :param gamma: Timing variability parameter for lead-lag relationships.
+    :return: List of data frames for each asset.
+    """
+    dfs = []
+    base_timestamps = np.sort(np.random.uniform(0, 100, n_points))
+    base_prices = np.cumsum(np.random.randn(n_points)) + 100  # Random walk
+
+    for asset in range(n_assets):
+        timestamps = base_timestamps + np.random.uniform(-gamma, gamma, n_points)
+        prices = base_prices + noise_level * np.random.randn(n_points)
+        log_returns = np.diff(np.log(prices))  # Compute log returns
+        dfs.append(
+            pd.DataFrame(
+                {"time": timestamps[1:], "log_return": log_returns}
+            ).sort_values(by="time")
+        )
+
+    # Apply lead-lag relationships
+    if lead_lags:
+        for leader, lagger, lag in lead_lags:
+            for i in range(len(dfs[leader]) - lag):
+                dfs[lagger].iloc[i + lag, dfs[lagger].columns.get_loc("log_return")] += (
+                    dfs[leader].iloc[i, dfs[leader].columns.get_loc("log_return")]
+                )
+
+    return dfs
