@@ -544,3 +544,155 @@ if __name__ == "__main__":
             print("  Signature-Based Method:")
             print(f"    Best lag: {best_lag_sig} (positive => Asset {i} leads)")
             print(f"    Signature similarity at best lag: {best_sim:.3f}")
+/====
+
+# Hayashi–Yoshida Estimator
+def hayashi_yoshida(df1, df2):
+    """
+    Compute the Hayashi-Yoshida estimator for covariation.
+    :param df1: DataFrame for the first asset with 'time' and 'log_return'.
+    :param df2: DataFrame for the second asset with 'time' and 'log_return'.
+    :return: Hayashi-Yoshida estimate of covariation.
+    """
+    df1 = df1.sort_values(by="time")  # Ensure time is sorted
+    df2 = df2.sort_values(by="time")
+
+    df1["delta"] = df1["log_return"]
+    df2["delta"] = df2["log_return"]
+
+    # Merge on overlapping times
+    merged = pd.merge_asof(df1, df2, on="time", direction="nearest", suffixes=("_1", "_2"))
+    merged = merged[(merged["delta_1"].notna()) & (merged["delta_2"].notna())]
+
+    # Compute HY estimator
+    hy_cov = np.sum(merged["delta_1"] * merged["delta_2"])
+    return hy_cov
+
+# Cross-Correlation
+def compute_cross_correlation(series1, series2, max_lag=10):
+    """
+    Compute cross-correlation between two time series.
+    :param series1: First time series.
+    :param series2: Second time series.
+    :param max_lag: Maximum lag to consider.
+    :return: Lag values and cross-correlation values.
+    """
+    lags = np.arange(-max_lag, max_lag + 1)
+    corr = [
+        np.corrcoef(series1[:-lag], series2[lag:])[0, 1]
+        if lag > 0
+        else np.corrcoef(series1[-lag:], series2[:lag])[0, 1]
+        if lag < 0
+        else np.corrcoef(series1, series2)[0, 1]
+        for lag in lags
+    ]
+    return lags, corr
+
+# Dynamic Time Warping (DTW)
+def compute_dtw(series1, series2):
+    """
+    Compute the Dynamic Time Warping (DTW) distance and alignment.
+    :param series1: First time series (1D array).
+    :param series2: Second time series (1D array).
+    :return: DTW distance and path.
+    """
+    # Ensure inputs are 1-D arrays
+    series1 = series1.flatten() if series1.ndim > 1 else series1
+    series2 = series2.flatten() if series2.ndim > 1 else series2
+
+    # Compute DTW
+    distance, path = fastdtw(series1, series2, dist=euclidean)
+    return distance, path
+
+# Thermal Optimal Path (TOP)
+def compute_top(series1, series2, beta=1.0):
+    """
+    Compute the Thermal Optimal Path (TOP) between two time series.
+    :param series1: First time series (1D array).
+    :param series2: Second time series (1D array).
+    :param beta: Smoothing parameter (controls path variability).
+    :return: Optimal path and cost matrix.
+    """
+    n, m = len(series1), len(series2)
+    dist_matrix = np.zeros((n, m))
+    cost_matrix = np.zeros((n, m))
+    path_matrix = np.zeros((n, m), dtype=int)
+
+    # Compute distance matrix
+    for i in range(n):
+        for j in range(m):
+            dist_matrix[i, j] = (series1[i] - series2[j]) ** 2
+
+    # Initialize cost matrix
+    cost_matrix[0, :] = dist_matrix[0, :]
+    path_matrix[0, :] = np.arange(m)
+
+    # Dynamic programming to compute the cost matrix
+    for i in range(1, n):
+        for j in range(m):
+            prev_costs = cost_matrix[i - 1, max(0, j - 1): min(m, j + 2)]
+            smoothness_penalty = beta * np.abs(np.arange(max(0, j - 1), min(m, j + 2)) - j)
+            total_costs = prev_costs + smoothness_penalty
+            min_idx = np.argmin(total_costs)
+
+            cost_matrix[i, j] = dist_matrix[i, j] + total_costs[min_idx]
+            path_matrix[i, j] = max(0, j - 1) + min_idx
+
+    # Backtrack to find the optimal path
+    optimal_path = []
+    j = np.argmin(cost_matrix[-1, :])  # Start from the last row
+    for i in range(n - 1, -1, -1):
+        optimal_path.append((i, j))
+        j = path_matrix[i, j]
+    optimal_path.reverse()
+
+    return optimal_path, cost_matrix
+if __name__ == "__main__":
+    # Generate asynchronous log returns with lead-lag relationships
+    n_assets = 3
+    n_points = 200
+    lead_lags = [(0, 1, 5), (1, 2, 3)]  # Lead-lag relationships
+    noise_level = 0.01
+    gamma = 2
+    data_frames = generate_asynchronous_log_returns(
+        n_points, n_assets, lead_lags, noise_level, gamma
+    )
+
+    results = []
+
+    # Compute lead-lag relationships for all pairs
+    for i in range(n_assets):
+        for j in range(i + 1, n_assets):
+            df1, df2 = data_frames[i], data_frames[j]
+            series1, series2 = df1["log_return"].values, df2["log_return"].values
+
+            # Cross-Correlation
+            lags, corr = compute_cross_correlation(series1, series2, max_lag=10)
+            best_lag = lags[np.argmax(corr)]
+
+            # Hayashi-Yoshida
+            hy_cov = hayashi_yoshida(df1, df2)
+
+#             # Dynamic Time Warping
+#             dtw_distance, _ = compute_dtw(series1, series2)
+
+            # Thermal Optimal Path
+            _, top_cost_matrix = compute_top(series1, series2)
+            top_cost = top_cost_matrix[-1, np.argmin(top_cost_matrix[-1, :])]
+
+            # Store results
+            results.append(
+                {
+                    "Asset Pair": f"{i}-{j}",
+                    "Cross-Corr Lag": best_lag,
+                    "Cross-Corr Coeff": max(corr),
+                    "HY Cov": hy_cov,
+#                     "DTW Distance": dtw_distance,
+                    "TOP Cost": top_cost,
+                }
+            )
+
+    # Convert results to DataFrame for display
+    results_df = pd.DataFrame(results)
+    print(results_df)
+    
