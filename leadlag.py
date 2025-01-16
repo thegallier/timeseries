@@ -738,3 +738,37 @@ def generate_asynchronous_log_returns(
                 )
 
     return dfs
+
+/===
+import numpy as np
+import pandas as pd
+from sktime.transformations.series.signature_based import SignatureTransformer
+
+# Example DataFrame
+data = {
+    "time": [1, 2, 3, 4, 5],
+    "series_1": [1.0, 2.0, 1.5, 2.5, 3.0],
+    "series_2": [0.5, 1.0, 1.0, 1.5, 2.0],
+}
+df = pd.DataFrame(data)
+
+# Step 1: Create shifted lead-lag combinations
+def create_shifted_lead_lag(df, series_1, series_2, time_col, shift):
+    """
+    Creates a lead-lag representation of two series with a specific time shift.
+    Positive shift aligns series_2 to be ahead of series_1, negative shifts do the opposite.
+    """
+    time_series = df.set_index(time_col)
+    s1 = time_series[series_1]
+    s2 = time_series[series_2].shift(shift, fill_value=0)  # Shift series_2
+    lead_lag_df = pd.DataFrame({
+        f"{series_1}_lead": s1,
+        f"{series_1}_lag": s1.shift(1, fill_value=s1.iloc[0]),
+        f"{series_2}_lead": s2,
+        f"{series_2}_lag": s2.shift(1, fill_value=s2.iloc[0])
+    })
+    return lead_lag_df
+
+# Generate shifted versions for multiple shifts
+shifts = range(-2, 3)  # Test shifts from -2 to +2
+shifted_data = {shift: create_shifted_lead_lag(df, "series_1", "series_2", "time", shift) for shift in shifts}
