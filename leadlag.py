@@ -1086,3 +1086,116 @@ def visualize_relationships_as_dag(relationships):
 # Visualize the relationships
 visualize_relationships_as_dag(relationships)
 
++++++
+
+import numpy as np
+import pandas as pd
+import esig
+import plotly.graph_objects as go
+
+# Example: Create synthetic data for n securities
+n = 5  # Number of securities
+time_steps = 10
+data = {
+    f"series_{i+1}": np.sin(np.linspace(0, 2 * np.pi, time_steps) + i * 0.5)
+    for i in range(n)
+}
+data["time"] = np.arange(time_steps)
+df = pd.DataFrame(data)
+
+# Step 1: Compute pairwise relationships
+def compute_pairwise_signatures(df, time_col, depth=2, threshold=0.05):
+    """Compute pairwise cross terms for n securities and filter by threshold."""
+    securities = [col for col in df.columns if col != time_col]
+    results = []
+    
+    for i, s1 in enumerate(securities):
+        for j, s2 in enumerate(securities):
+            if i != j:  # Avoid self-interactions
+                # Create a stream for the two series
+                stream = df[[s1, s2]].to_numpy()
+                
+                # Compute the signature up to the given depth
+                sig = esig.stream2sig(stream, depth)
+                
+                # Extract relevant cross term (depth 2, e.g., ∫s1 ds2)
+                sig_keys = esig.sigkeys(2, depth)  # Keys for interpretation
+                term_index = sig_keys.index((1, 2))  # Example term ∫s1 ds2
+                
+                term_value = sig[term_index]
+                
+                # Filter based on threshold
+                if abs(term_value) > threshold:
+                    results.append((s1, s2, term_value))
+
+    return results
+
+# Calculate pairwise relationships
+threshold = 0.1
+relationships = compute_pairwise_signatures(df, "time", depth=2, threshold=threshold)
+print("Filtered relationships (above threshold):")
+print(relationships)
+
+# Step 2: Visualize the relationships using Plotly
+def visualize_relationships_dag_plotly(relationships):
+    """Visualize pairwise relationships as a DAG using Plotly."""
+    sources, targets, weights = zip(*relationships)
+
+    # Create nodes and edges for the DAG
+    nodes = list(set(sources) | set(targets))
+    node_indices = {node: idx for idx, node in enumerate(nodes)}
+
+    edge_x = []
+    edge_y = []
+    annotations = []
+    
+    for src, tgt, weight in relationships:
+        edge_x.append([node_indices[src], node_indices[tgt]])
+        edge_y.append([weight, weight])
+        annotations.append(f"{src} → {tgt}: {weight:.2f}")
+
+    fig = go.Figure()
+
+    # Add nodes
+    fig.add_trace(go.Scatter(
+        x=list(node_indices.values()),
+        y=[0] * len(node_indices),  # Single-layer DAG
+        mode='markers+text',
+        text=list(node_indices.keys()),
+        textposition="top center",
+        marker=dict(size=20, color="skyblue"),
+    ))
+
+    # Add edges
+    for ex, ey in zip(edge_x, edge_y):
+        fig.add_trace(go.Scatter(
+            x=ex, y=[0, 0],
+            mode='lines',
+            line=dict(color="gray", width=2),
+        ))
+
+    # Add annotations for edge weights
+    for i, annotation in enumerate(annotations):
+        src, tgt = edge_x[i]
+        fig.add_trace(go.Scatter(
+            x=[src, tgt],
+            y=[0.1, 0.1],
+            text=[annotation],
+            mode='text',
+            textfont=dict(size=10),
+            textposition="top center",
+        ))
+
+    # Finalize layout
+    fig.update_layout(
+        title="Lead-Lag Relationships DAG",
+        showlegend=False,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        height=600,
+    )
+    fig.show()
+
+# Visualize the relationships
+visualize_relationships_dag_plotly(relationships)
+
