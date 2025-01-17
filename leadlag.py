@@ -635,6 +635,162 @@ def compute_top(series1, series2, beta=1.0):
             total_costs = prev_costs + smoothness_penalty
             min_idx = np.argmin(total_costs)
 
+            /===
+
+    import numpy as np
+import pandas as pd
+from sktime.transformations.series.signature_based import SignatureTransformer
+
+# Example: Three series with lead-lag relationships
+data = {
+    "time": [1, 2, 3, 4, 5],
+    "series_1": [1.0, 2.0, 3.0, 4.0, 5.0],  # Leading series
+    "series_2": [0.5, 1.5, 2.5, 3.5, 4.5],  # Lags behind series_1
+    "series_3": [0.2, 0.6, 1.0, 1.4, 1.8],  # Lags behind series_2
+}
+df = pd.DataFrame(data)
+
+# Prepare data for signature transform
+def create_lead_lag_3series(df, time_col):
+    """Create lead-lag representation for three series."""
+    time_series = df.set_index(time_col)
+    s1 = time_series["series_1"]
+    s2 = time_series["series_2"]
+    s3 = time_series["series_3"]
+    lead_lag_df = pd.DataFrame({
+        "series_1_lead": s1,
+        "series_1_lag": s1.shift(1, fill_value=s1.iloc[0]),
+        "series_2_lead": s2,
+        "series_2_lag": s2.shift(1, fill_value=s2.iloc[0]),
+        "series_3_lead": s3,
+        "series_3_lag": s3.shift(1, fill_value=s3.iloc[0]),
+    })
+    return lead_lag_df
+
+lead_lag_df = create_lead_lag_3series(df, "time")
+X = [lead_lag_df.values]  # Single sample
+
+# Compute signature features
+transformer = SignatureTransformer(depth=2)
+signature_features = transformer.fit_transform(X)
+
+# Extract terms from the signature
+feature_names = transformer.get_feature_names_out()
+print("Feature names:", feature_names)
+
+# Analyze pairwise and higher-order terms
+results = {}
+
+# Example: Extract and compare pairwise cross terms
+pairwise_terms = [
+    ("X_0,X_1", "∫x dy"),
+    ("X_1,X_2", "∫y dz"),
+    ("X_2,X_0", "∫z dx"),
+]
+
+for term, description in pairwise_terms:
+    if term in feature_names:
+        term_index = feature_names.tolist().index(term)
+        term_value = signature_features[0, term_index]
+        results[description] = term_value
+
+# Print results
+print("Pairwise cross terms:")
+for description, value in results.items():
+    print(f"{description}: {value}")
+
+# Example: Analyze higher-order terms
+higher_order_terms = [
+    ("X_0,X_1,X_2", "∫x dy dz"),
+    ("X_1,X_2,X_0", "∫y dz dx"),
+]
+
+for term, description in higher_order_terms:
+    if term in feature_names:
+        term_index = feature_names.tolist().index(term)
+        term_value = signature_features[0, term_index]
+        results[description] = term_value
+
+print("\nHigher-order terms:")
+for description, value in results.items():
+    print(f"{description}: {value}")
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from sktime.transformations.series.signature_based import SignatureTransformer
+
+# Example: Create synthetic data for n securities
+n = 5  # Number of securities
+time_steps = 10
+data = {
+    f"series_{i+1}": np.sin(np.linspace(0, 2 * np.pi, time_steps) + i * 0.5)
+    for i in range(n)
+}
+data["time"] = np.arange(time_steps)
+df = pd.DataFrame(data)
+
+# Step 1: Compute pairwise relationships
+def compute_pairwise_relationships(df, time_col, depth=2, threshold=0.05):
+    """Compute pairwise cross terms for n securities and filter by threshold."""
+    securities = [col for col in df.columns if col != time_col]
+    lead_lag_df = df[securities].copy()
+    X = [lead_lag_df.values]  # Single sample for simplicity
+
+    # Compute signature features
+    transformer = SignatureTransformer(depth=depth)
+    signature_features = transformer.fit_transform(X)
+    feature_names = transformer.get_feature_names_out()
+
+    # Extract pairwise cross terms and filter by threshold
+    results = []
+    for i, s1 in enumerate(securities):
+        for j, s2 in enumerate(securities):
+            if i != j:  # Avoid self-interactions
+                term = f"X_{i},X_{j}"  # Pairwise interaction term
+                if term in feature_names:
+                    term_index = feature_names.tolist().index(term)
+                    term_value = signature_features[0, term_index]
+                    if abs(term_value) > threshold:
+                        results.append((s1, s2, term_value))
+
+    return results
+
+# Calculate pairwise relationships
+threshold = 0.1
+relationships = compute_pairwise_relationships(df, "time", depth=2, threshold=threshold)
+print("Filtered relationships (above threshold):")
+print(relationships)
+
+def visualize_relationships_as_dag(relationships):
+    """Visualize pairwise relationships as a DAG."""
+    G = nx.DiGraph()
+
+    # Add edges with weights
+    for source, target, weight in relationships:
+        G.add_edge(source, target, weight=weight)
+
+    # Generate positions for a nicer layout
+    pos = nx.spring_layout(G)
+
+    # Draw the graph
+    plt.figure(figsize=(10, 7))
+    nx.draw_networkx_nodes(G, pos, node_size=700, node_color="skyblue")
+    nx.draw_networkx_edges(G, pos, edgelist=G.edges(), arrowstyle="->", arrowsize=20)
+    nx.draw_networkx_labels(G, pos, font_size=12, font_color="black")
+
+    # Add edge labels (weights)
+    edge_labels = {(u, v): f"{d['weight']:.2f}" for u, v, d in G.edges(data=True)}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10)
+
+    plt.title("Lead-Lag Relationships DAG", fontsize=16)
+    plt.axis("off")
+    plt.show()
+
+# Visualize the relationships
+visualize_relationships_as_dag(relationships)
+
             cost_matrix[i, j] = dist_matrix[i, j] + total_costs[min_idx]
             path_matrix[i, j] = max(0, j - 1) + min_idx
 
