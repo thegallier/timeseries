@@ -1,5 +1,259 @@
 import numpy as np
 import cvxpy as cp
+from numpy.linalg import eigvalsh
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.model_selection import KFold
+
+class AsymmetricRidgeRegression:
+    def __init__(self, lambda_pos=1.0, lambda_neg=10.0, alpha=None, cv=5, random_state=None):
+        """
+        Initialize the model.
+        
+        Args:
+            lambda_pos (float): L2 penalty multiplier for positive weights.
+            lambda_neg (float): L2 penalty multiplier for negative weights.
+            alpha (float or None): Shrinkage factor in [0,1] for the correlation matrix. 
+                                   If None, it will be determined via cross-validation.
+            cv (int): Number of folds in cross-validation.
+            random_state (int or None): Seed for reproducibility.
+        """
+        self.lambda_pos = lambda_pos
+        self.lambda_neg = lambda_neg
+        self.alpha = alpha  # If set, use user-specified alpha; otherwise, choose via CV.
+        self.cv = cv
+        self.random_state = random_state
+        
+        # To be determined at fit time:
+        self.alpha_ = None            # optimal alpha selected via CV.
+        self.coef_ = None             # fitted coefficients (weights)
+        self.intercept_ = None        # fitted intercept
+        self.X_mean_ = None           # mean of training features
+        self.y_mean_ = None           # mean of training target
+        
+        # Saved matrices for inspection/plotting:
+        self.R_ = None                # original correlation matrix (full data)
+        self.R_shrunk_ = None         # shrunk correlation matrix (with optimal alpha)
+        self.S_ = None                # original covariance matrix (from centered X)
+        self.S_shrunk_ = None         # shrunk covariance matrix (with optimal alpha)
+        
+        # CV history:
+        self.cv_alphas_ = None        # alphas grid tested
+        self.cv_scores_ = None        # corresponding CV MSE values
+
+    def _compute_shrunk_covariance(self, X_centered, alpha):
+        """
+        Given centered data, compute the shrunk covariance matrix S' = D * R' * D,
+        where R' = (1-alpha)*R + alpha*I and R is the correlation matrix.
+        
+        Returns:
+            S_shrunk (np.ndarray): The shrunk covariance matrix.
+            R (np.ndarray): The original correlation matrix.
+            R_shrunk (np.ndarray): The shrunk correlation matrix.
+        """
+        n, p = X_centered.shape
+        # Standard deviations (using population scaling: divide by n)
+        std = np.sqrt(np.sum(X_centered**2, axis=0) / n)
+        # Avoid division by zero:
+        std[std < 1e-12] = 1e-12
+        
+        # Compute sample covariance S (using 1/n)
+        S = (X_centered.T @ X_centered) / n
+        # Construct the correlation matrix R:
+        R = S / np.outer(std, std)
+        np.fill_diagonal(R, 1.0)
+        
+        # Shrink correlation: R' = (1-alpha)*R + alpha*I
+        R_shrunk = (1 - alpha) * R + alpha * np.eye(p)
+        # Reconstruct shrunk covariance: S' = D * R_shrunk * D
+        D = np.diag(std)
+        S_shrunk = D @ R_shrunk @ D
+        # Make sure S_shrunk is symmetric.
+        S_shrunk = (S_shrunk + S_shrunk.T) / 2.0
+        
+        # Optional: enforce PSD by clipping tiny negative eigenvalues.
+        eigvals = eigvalsh(S_shrunk)
+        if np.min(eigvals) < -1e-8:
+            eigvals_clipped = np.clip(eigvals, 0, None)
+            # Reconstruct S_shrunk with the clipped eigenvalues
+            eigvecs = np.linalg.eigh(S_shrunk)[1]
+            S_shrunk = eigvecs @ np.diag(eigvals_clipped) @ eigvecs.T
+        
+        return S_shrunk, R, R_shrunk
+
+    def _solve_qp(self, X, y, S_shrunk):
+        """
+        Solve the convex optimization problem:
+        
+           minimize   0.5*||X*w - y||^2 + 0.5*w^T S_shrunk w 
+                      + lambda_pos * ||cp.pos(w)||^2 + lambda_neg * ||cp.neg(w)||^2
+        
+        Args:
+            X (np.ndarray): Centered design matrix.
+            y (np.ndarray): Centered target vector.
+            S_shrunk (np.ndarray): Shrunk covariance matrix.
+            
+        Returns:
+            w (np.ndarray): Coefficient vector.
+        """
+        p = X.shape[1]
+        w_var = cp.Variable(p)
+        # Data fidelity term:
+        loss = 0.5 * cp.sum_squares(X @ w_var - y)
+        # Covariance penalty term:
+        penalty_cov = 0.5 * cp.quad_form(w_var, S_shrunk)
+        # Asymmetric L2 penalties: penalize positive and negative parts differently.
+        penalty_asym = self.lambda_pos * cp.sum_squares(cp.pos(w_var)) + \
+                       self.lambda_neg * cp.sum_squares(cp.neg(w_var))
+        objective = cp.Minimize(loss + penalty_cov + penalty_asym)
+        prob = cp.Problem(objective)
+        prob.solve(solver=cp.SCS, verbose=False)
+        if w_var.value is None:
+            # Fall back to pseudo-inverse if needed
+            w = np.zeros(p)
+        else:
+            w = w_var.value
+        return w
+
+    def fit(self, X, y):
+        """
+        Fit the asymmetric ridge regression model on the data.
+        
+        If alpha was not provided at initialization, this method will select 
+        the best alpha in [0,1] using 5-fold cross-validation (minimizing MSE).
+        
+        Args:
+            X (np.ndarray): Training data of shape (n_samples, n_features).
+            y (np.ndarray): Target vector of shape (n_samples,).
+            
+        Returns:
+            self
+        """
+        X = np.asarray(X)
+        y = np.asarray(y)
+        n, p = X.shape
+        
+        # Set random state if provided:
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+        
+        # Center the data (for intercept handling):
+        self.X_mean_ = X.mean(axis=0)
+        self.y_mean_ = y.mean()
+        X_centered = X - self.X_mean_
+        y_centered = y - self.y_mean_
+        
+        if self.alpha is not None:
+            # Use user-specified alpha (ensure it lies in [0,1])
+            alpha_use = float(np.clip(self.alpha, 0.0, 1.0))
+            self.alpha_ = alpha_use
+            S_shrunk, R, R_shrunk = self._compute_shrunk_covariance(X_centered, alpha_use)
+            self.R_ = R
+            self.R_shrunk_ = R_shrunk
+            self.S_ = (X_centered.T @ X_centered) / n
+            self.S_shrunk_ = S_shrunk
+            # Solve for weights using the full dataset.
+            w = self._solve_qp(X_centered, y_centered, S_shrunk)
+            self.coef_ = w
+            self.intercept_ = self.y_mean_ - self.X_mean_.dot(w)
+            self.cv_alphas_ = np.array([alpha_use])
+            self.cv_scores_ = np.array([np.mean((y_centered - X_centered.dot(w))**2)])
+            return self
+        
+        # Otherwise, select alpha via cross-validation.
+        alphas_grid = np.linspace(0, 1, 21)  # e.g., 0.0, 0.05, …, 1.0
+        kf = KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+        cv_scores = []
+        
+        # For each candidate alpha, perform CV:
+        for alpha_val in alphas_grid:
+            mse_folds = []
+            for train_idx, val_idx in kf.split(X_centered):
+                X_train, X_val = X_centered[train_idx], X_centered[val_idx]
+                y_train, y_val = y_centered[train_idx], y_centered[val_idx]
+                # Compute shrunk covariance for training data:
+                S_shrunk_train, _, _ = self._compute_shrunk_covariance(X_train, alpha_val)
+                # Solve for weights on training fold:
+                w_train = self._solve_qp(X_train, y_train, S_shrunk_train)
+                # Compute predictions on validation fold:
+                y_pred = X_val.dot(w_train) + (y_train.mean() - X_train.mean(axis=0).dot(w_train))
+                mse = np.mean((y_val - y_pred)**2)
+                mse_folds.append(mse)
+            cv_scores.append(np.mean(mse_folds))
+        cv_scores = np.array(cv_scores)
+        best_idx = int(np.argmin(cv_scores))
+        alpha_opt = alphas_grid[best_idx]
+        self.cv_alphas_ = alphas_grid
+        self.cv_scores_ = cv_scores
+        
+        # Refit on the full data with the optimal alpha:
+        self.alpha_ = alpha_opt
+        S_shrunk, R, R_shrunk = self._compute_shrunk_covariance(X_centered, alpha_opt)
+        self.R_ = R
+        self.R_shrunk_ = R_shrunk
+        self.S_ = (X_centered.T @ X_centered) / n
+        self.S_shrunk_ = S_shrunk
+        
+        w = self._solve_qp(X_centered, y_centered, S_shrunk)
+        self.coef_ = w
+        self.intercept_ = self.y_mean_ - self.X_mean_.dot(w)
+        return self
+    
+    def predict(self, X):
+        """
+        Make predictions on new data.
+        
+        Args:
+            X (np.ndarray): New data of shape (n_samples, n_features).
+            
+        Returns:
+            y_pred (np.ndarray): Predicted targets.
+        """
+        X = np.asarray(X)
+        return X.dot(self.coef_) + self.intercept_
+    
+    def plot_cv_results(self):
+        """
+        Plot CV results using Plotly:
+         - Plot of CV MSE vs. alpha.
+         - Heatmaps of the original correlation matrix R and the shrunk correlation matrix R_shrunk.
+        """
+        if self.cv_alphas_ is None or self.cv_scores_ is None:
+            print("No CV history available. Fit with alpha=None for cross-validation.")
+            return
+        
+        # Plot CV MSE vs. alpha:
+        fig1 = px.line(x=self.cv_alphas_, y=self.cv_scores_,
+                       labels={'x': "Alpha", 'y': "CV MSE"},
+                       title="5-Fold CV MSE vs. Shrinkage Factor (alpha)")
+        fig1.add_scatter(x=[self.alpha_], y=[self.cv_scores_[np.argmin(self.cv_scores_)]],
+                         mode='markers', marker=dict(size=12, color='red'),
+                         name="Selected alpha")
+        fig1.show()
+        
+        # Plot original vs shrunk correlation matrices as heatmaps.
+        # (We assume self.R_ and self.R_shrunk_ are computed from the full dataset.)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Heatmap(z=self.R_,
+                                  x=[f"F{i}" for i in range(1, self.R_.shape[0]+1)],
+                                  y=[f"F{i}" for i in range(1, self.R_.shape[0]+1)],
+                                  colorscale='Viridis',
+                                  zmin=-1, zmax=1))
+        fig2.update_layout(title="Original Correlation Matrix", xaxis_title="Features", yaxis_title="Features")
+        fig2.show()
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Heatmap(z=self.R_shrunk_,
+                                  x=[f"F{i}" for i in range(1, self.R_shrunk_.shape[0]+1)],
+                                  y=[f"F{i}" for i in range(1, self.R_shrunk_.shape[0]+1)],
+                                  colorscale='Viridis',
+                                  zmin=-1, zmax=1))
+        fig3.update_layout(title=f"Shrunk Correlation Matrix (alpha={self.alpha_:.2f})", 
+                           xaxis_title="Features", yaxis_title="Features")
+        fig3.show()
+/--
+import numpy as np
+import cvxpy as cp
 
 class AsymmetricRidgeRegression:
     def __init__(self, alpha=None):
