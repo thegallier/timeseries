@@ -2413,23 +2413,23 @@ def print_practical_tips():
 if __name__ == "__main__":
     results, figures = benchmark_with_visualization()
     print_practical_tips()
-#====
-
+#==== v 12
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from typing import Optional, List, Tuple
 
 # === 1. OLS Helper ===
 @jax.jit
-def ols_kernel(X_win, Y_win):
+def ols_kernel(X_win: jnp.ndarray, Y_win: jnp.ndarray) -> jnp.ndarray:
     """
     Ordinary least squares solver for one window: returns (d, m).
     """
-    XtX = X_win.T @ X_win  # (d, d)
-    XtY = X_win.T @ Y_win  # (d, m)
+    XtX = X_win.T @ X_win
+    XtY = X_win.T @ Y_win
     return jnp.linalg.solve(XtX + 1e-6 * jnp.eye(XtX.shape[0]), XtY)
 
 # === 2. Sliding Regression Factory ===
@@ -2440,40 +2440,51 @@ def make_sliding_regression_with_constraint_fn(
     epsilon: float = 1e-3,
     big_penalty: float = 1e6,
     group_by_country: bool = False,
-    n_countries: int = None,
-    n_tenors: int = None,
-    forced_group_mask: jnp.ndarray = None,    # bool[c, t, d]
-    forced_group_value: jnp.ndarray = None,   # float[c, t, d]
-    equal_opposite_constraints: list = None,  # list of (feat, country_i, country_j)
-    method: str = "penalty",
+    n_countries: Optional[int] = None,
+    n_tenors: Optional[int] = None,
+    forced_group_mask: Optional[jnp.ndarray] = None,    # bool[c, t, d]
+    forced_group_value: Optional[jnp.ndarray] = None,   # float[c, t, d]
+    equal_opposite_constraints: Optional[List[Tuple[int,int,int]]] = None,
+    method: str = "penalty",                   # "penalty" or "kkt"
     freeze_non_masked: bool = False,
-    max_frozen: int = None
+    max_frozen: Optional[int] = None
 ):
     """
-    Returns _sliding(X, Y) -> (W_ols, W_final, mask) with shapes:
-      W_ols, W_final: (windows, d, m)
-      mask:          (windows, d, m)
+    Returns _sliding(X, Y) -> (W_ols, W_final, mask) arrays of shape (windows, d, m).
+
+    Parameters:
+      t1, t2: window size and stride
+      epsilon: threshold for automatic small-coef masking
+      big_penalty: penalty strength
+      group_by_country: whether to interpret mask shape
+      n_countries, n_tenors: grouping dims if group_by_country
+      forced_group_mask/value: optional floors per (c,t,feat)
+      equal_opposite_constraints: list of (feat,i,j) to enforce w[f,i,t] = -w[f,j,t]
+      method: "penalty" (Cholesky) or "kkt" (hard constraints)
+      freeze_non_masked: in penalty mode, lock unmasked to OLS
+      max_frozen: max constraints for KKT static sizing
     """
-    # Determine d, m for grouping
+    # Precompute grouping dims if needed
     if group_by_country and forced_group_mask is not None:
         d = forced_group_mask.shape[2]
         m = n_countries * n_tenors
     else:
-        # will infer from input in _sliding
-        d = None
-        m = None
+        d = None; m = None
 
-    # Prebuild KKT C, b once (vectorized)
+    # Prebuild KKT C and b for method="kkt"
     if method == "kkt":
-        if forced_group_mask is None:
-            raise ValueError("KKT method requires forced_group_mask with group_by_country=True")
-        # d, m must be known
-        assert d is not None and m is not None
-        # Floors
+        # require mask
+        if forced_group_mask is None or not group_by_country:
+            raise ValueError("KKT requires group_by_country=True and forced_group_mask set")
+        # dims
+        d = forced_group_mask.shape[2]
+        m = n_countries * n_tenors
+        # floors
         ci, ti, fi = jnp.where(forced_group_mask)
         floor_idx = fi * m + (ci * n_tenors + ti)
-        floor_vals = forced_group_value[ci, ti, fi] if forced_group_value is not None else jnp.zeros_like(floor_idx, float)
-        # Equal-opposite
+        floor_vals = (forced_group_value[ci,ti,fi] if forced_group_value is not None
+                      else jnp.zeros_like(floor_idx, float))
+        # equal-opposite
         if equal_opposite_constraints:
             eq = jnp.array(equal_opposite_constraints)
             feats, c1, c2 = eq[:,0], eq[:,1], eq[:,2]
@@ -2485,78 +2496,85 @@ def make_sliding_regression_with_constraint_fn(
             idx2 = f_rep * m + (j_rep * n_tenors + ti_rep)
             pair_idx = jnp.stack([idx1, idx2], axis=1)
         else:
-            pair_idx = jnp.zeros((0,2), int)
+            pair_idx = jnp.zeros((0,2), dtype=int)
+        # assemble C, b
         num_f = floor_idx.shape[0]
         num_p = pair_idx.shape[0]
         total = num_f + num_p
         MC = max_frozen or total
         C = jnp.zeros((MC, d*m))
         b = jnp.zeros((MC,))
+        # scatter floors
         rows_f = jnp.arange(num_f)
         C = C.at[rows_f, floor_idx].set(1)
         b = b.at[rows_f].set(floor_vals)
-        rows_p = jnp.arange(num_f, num_f+num_p)
+        # scatter pairs
+        rows_p = jnp.arange(num_f, num_f + num_p)
         C = C.at[rows_p[:,None], pair_idx].set(1)
-        # b rows_p are zero
+        # b rows_p stay zero
 
     def _sliding(X: jnp.ndarray, Y: jnp.ndarray):
         n, d_in = X.shape
         _, m_in = Y.shape
-        # infer dims if needed
-        _d = d if 'd' in locals() and d is not None else d_in
-        _m = m if 'm' in locals() and m is not None else m_in
+        _d = d if d is not None else d_in
+        _m = m if m is not None else m_in
         windows = (n - t1) // t2 + 1
         starts = jnp.arange(windows) * t2
 
-        # sliding windows
+        # extract windows
         slc = lambda D: jax.vmap(lambda s: jax.lax.dynamic_slice(D, (s, 0), (t1, D.shape[1])))(starts)
         X_w = slc(X)  # (windows, t1, _d)
         Y_w = slc(Y)  # (windows, t1, _m)
 
-        # compute OLS per window
-        W_ols = jax.vmap(ols_kernel)(X_w, Y_w)  # (windows, _d, _m)
+        # OLS per window
+        W_ols = jax.vmap(ols_kernel)(X_w, Y_w)
 
-        # build mask per window
+        # mask
         if forced_group_mask is not None:
             fg = forced_group_mask
-            mask = jnp.broadcast_to(fg[None], (windows,) + fg.shape)
-            mask = mask.transpose(0, 3, 1, 2).reshape(windows, _d, _m)
+            mask = jnp.broadcast_to(fg[None], (windows,)+fg.shape)
+            mask = mask.transpose(0,3,1,2).reshape(windows, _d, _m)
         else:
             mask = jnp.abs(W_ols) < epsilon
 
-        # build floor_values per window
+        # floor vals per window
         if forced_group_value is not None:
             fv = forced_group_value
-            fv_w = jnp.broadcast_to(fv[None], (windows,) + fv.shape)
-            floor_vals_w = fv_w.transpose(0, 3, 1, 2).reshape(windows, _d, _m)
+            fv_w = jnp.broadcast_to(fv[None], (windows,)+fv.shape)
+            floor_vals_w = fv_w.transpose(0,3,1,2).reshape(windows, _d, _m)
         else:
-            floor_vals_w = jnp.zeros((windows, _d, _m)) if freeze_non_masked else None
+            floor_vals_w = None
 
-        # penalty branch
         if method == "penalty":
+            # penalized via Cholesky
             penalty = jnp.where(mask, big_penalty, 0.0)
             def solve_pen(Xi, Yi, pi, fv, mask_i, wols_i):
-                XtX = Xi.T @ Xi; XtY = Xi.T @ Yi
-                Wp = jax.vmap(lambda col, pen: jnp.linalg.solve(XtX + jnp.diag(pen), col), in_axes=(1,1))(XtY, pi).T
-                # apply floors
-                if forced_group_value is not None:
+                XtX = Xi.T @ Xi + 1e-6*jnp.eye(_d)
+                XtY = Xi.T @ Yi
+                # build Hessians (d,d,m)
+                H = XtX[:,:,None] + jnp.einsum('dm,df->dfm', pi, jnp.eye(_d))
+                # solve per output
+                def chol_solve(Hm, y):
+                    L = jnp.linalg.cholesky(Hm)
+                    z = jax.scipy.linalg.solve_triangular(L, y, lower=True)
+                    return jax.scipy.linalg.solve_triangular(L.T, z, lower=False)
+                Wp = jax.vmap(chol_solve, in_axes=(2,1), out_axes=1)(H, XtY)
+                if fv is not None:
                     Wp = jnp.where(Wp < fv, fv, Wp)
-                # freeze non-masked
                 if freeze_non_masked:
                     Wp = jnp.where(mask_i, Wp, wols_i)
                 return Wp
-            # vectorized over windows, passing per-window mask and W_ols
             W_final = jax.vmap(solve_pen)(X_w, Y_w, penalty, floor_vals_w, mask, W_ols)
-
-        # kkt branch
         else:
+            # hard constraints via KKT
             def solve_kkt(Xi, Yi):
-                XtX = Xi.T @ Xi; XtY = Xi.T @ Yi
+                XtX = Xi.T @ Xi
+                XtY = Xi.T @ Yi
                 H = jnp.kron(jnp.eye(_m), XtX)
                 g = XtY.ravel('F')
-                KKT_mat = jnp.block([[H, C.T], [C, jnp.zeros((C.shape[0], C.shape[0]))]])
-                sol = jnp.linalg.solve(KKT_mat, jnp.concatenate([g, b], 0))
-                return sol[:_d * _m].reshape((_d, _m), order='F')
+                KKT_mat = jnp.block([[H, C.T],[C, jnp.zeros((C.shape[0],C.shape[0]))]])
+                sol = jnp.linalg.solve(KKT_mat, jnp.concatenate([g,b],0))
+                return sol[:_d*_m].reshape((_d,_m), order='F')
             W_final = jax.vmap(solve_kkt)(X_w, Y_w)
 
         return W_ols, W_final, mask
@@ -2578,32 +2596,27 @@ if __name__ == '__main__':
     fg_mask = fg_mask.at[2,:,2].set(True); fg_val = fg_val.at[2,:,2].set(0.1)
     fg_mask = fg_mask.at[3,:,4].set(True); fg_val = fg_val.at[3,:,4].set(0.2)
     eq = [(2,2,3),(4,2,3)]
-    max_f = int(jnp.sum(fg_mask)) + len(eq) * n_t
+    max_f = int(jnp.sum(fg_mask)) + len(eq)*n_t
 
-    fn_pen = make_sliding_regression_with_constraint_fn(
+    fn = make_sliding_regression_with_constraint_fn(
         t1, t2,
-        group_by_country=True,
-        n_countries=n_c, n_tenors=n_t,
-        forced_group_mask=fg_mask,
-        forced_group_value=fg_val,
+        group_by_country=True, n_countries=n_c, n_tenors=n_t,
+        forced_group_mask=fg_mask, forced_group_value=fg_val,
         equal_opposite_constraints=eq,
-        method='penalty',
-        freeze_non_masked=True,
+        method='penalty', freeze_non_masked=True,
         max_frozen=max_f
     )
-    fn_kkt = make_sliding_regression_with_constraint_fn(
+    W0_p, Wp, mask = fn(X, Y)
+
+    fn2 = make_sliding_regression_with_constraint_fn(
         t1, t2,
-        group_by_country=True,
-        n_countries=n_c, n_tenors=n_t,
-        forced_group_mask=fg_mask,
-        forced_group_value=fg_val,
+        group_by_country=True, n_countries=n_c, n_tenors=n_t,
+        forced_group_mask=fg_mask, forced_group_value=fg_val,
         equal_opposite_constraints=eq,
         method='kkt',
         max_frozen=max_f
     )
-
-    W0_p, Wp, mask = fn_pen(X, Y)
-    W0_k, Wk, _ = fn_kkt(X, Y)
+    W0_k, Wk, _ = fn2(X, Y)
 
     diff2d = np.array(jnp.mean(jnp.abs(Wp - Wk), axis=0))
     mask0 = np.array(mask[0])
@@ -2611,9 +2624,12 @@ if __name__ == '__main__':
     sns.heatmap(diff2d.T, cmap='coolwarm', center=0)
     for fi in range(d):
         for ti in range(m):
-            if mask0[fi, ti]: plt.gca().add_patch(plt.Rectangle((fi, ti), 1, 1, fill=False, edgecolor='k', lw=1.5))
+            if mask0[fi, ti]:
+                plt.gca().add_patch(plt.Rectangle((fi, ti), 1, 1, fill=False, edgecolor='k', lw=1.5))
     plt.xlabel('Feature')
     plt.ylabel('Target')
     plt.title('Mean |Wp - Wk| with Constraints')
     plt.tight_layout()
     plt.show()
+
+
