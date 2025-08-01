@@ -599,3 +599,596 @@ if __name__ == "__main__":
     
     # Visualize
     visualize_comprehensive_comparison(results, X, Y, window_size, stride, true_W, forced_group_mask)
+
+
+/====================== v6
+
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import seaborn as sns
+from functools import partial
+import time
+
+# ============= HUBER LOSS IMPLEMENTATION =============
+
+@jax.jit
+def huber_loss(residuals, delta=1.0):
+    """
+    Huber loss: quadratic for small errors, linear for large errors.
+    More robust to outliers than squared loss.
+    
+    L(r) = 0.5 * r^2           if |r| <= delta
+           delta * |r| - 0.5 * delta^2   if |r| > delta
+    """
+    abs_res = jnp.abs(residuals)
+    return jnp.where(
+        abs_res <= delta,
+        0.5 * residuals**2,
+        delta * abs_res - 0.5 * delta**2
+    )
+
+@jax.jit
+def huber_gradient(residuals, delta=1.0):
+    """Gradient of Huber loss"""
+    return jnp.where(
+        jnp.abs(residuals) <= delta,
+        residuals,
+        delta * jnp.sign(residuals)
+    )
+
+# ============= IRLS SOLVER WITH HUBER LOSS =============
+
+@jax.jit
+def solve_huber_regression(X, Y, delta=1.0, max_iter=20, tol=1e-4):
+    """
+    Solve regression with Huber loss using Iteratively Reweighted Least Squares (IRLS).
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    
+    # Initialize with OLS solution
+    XtX = X.T @ X + 1e-6 * jnp.eye(n_features)
+    XtY = X.T @ Y
+    W = jnp.linalg.solve(XtX, XtY)
+    
+    def irls_step(carry, _):
+        W_prev = carry
+        
+        # Compute residuals
+        residuals = Y - X @ W_prev
+        
+        # Compute weights for Huber loss
+        # w_i = 1 if |r_i| <= delta, delta/|r_i| otherwise
+        abs_res = jnp.abs(residuals)
+        weights = jnp.where(abs_res <= delta, 1.0, delta / (abs_res + 1e-8))
+        
+        # Weighted least squares update - vectorized version
+        W_new = jnp.zeros_like(W_prev)
+        
+        # Vectorize over outputs
+        def solve_single_output(j):
+            w_j = weights[:, j]
+            # Create weighted design matrix
+            X_weighted = X * w_j[:, None]
+            XtWX = X_weighted.T @ X
+            XtWY = X_weighted.T @ Y[:, j]
+            return jnp.linalg.solve(XtWX + 1e-6 * jnp.eye(n_features), XtWY)
+        
+        W_new = jax.vmap(solve_single_output, in_axes=0, out_axes=1)(jnp.arange(n_outputs))
+        
+        # Check convergence
+        converged = jnp.max(jnp.abs(W_new - W_prev)) < tol
+        
+        return W_new, converged
+    
+    # Use lax.scan for the iteration
+    W_final, _ = jax.lax.scan(irls_step, W, None, length=max_iter)
+    
+    return W_final
+
+# ============= ADAPTIVE THRESHOLD DISCOVERY ACROSS WINDOWS =============
+
+def discover_group_sparsity_pattern(X, Y, window_size, stride, n_countries, n_tenors, 
+                                   threshold_k=2.0, consistency_threshold=0.8,
+                                   use_huber=False, huber_delta=1.0):
+    """
+    Analyze coefficient patterns across windows to identify which should be consistently zero.
+    
+    Args:
+        X, Y: Full dataset
+        window_size, stride: Sliding window parameters
+        n_countries, n_tenors: Group structure
+        threshold_k: Adaptive threshold factor
+        consistency_threshold: Fraction of windows where coef must be small to be zeroed
+        use_huber: Whether to use Huber loss
+        huber_delta: Huber loss parameter
+    
+    Returns:
+        forced_group_mask: (n_countries, n_tenors, n_features) boolean mask
+        analysis_results: Dictionary with detailed analysis
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    # Storage for coefficient estimates across windows
+    all_coefficients = []
+    all_masks = []
+    
+    print(f"Analyzing {n_windows} windows...")
+    
+    # Extract windows and compute coefficients
+    for i in range(n_windows):
+        start = i * stride
+        end = start + window_size
+        X_win = X[start:end]
+        Y_win = Y[start:end]
+        
+        # Solve regression
+        if use_huber:
+            W = solve_huber_regression(X_win, Y_win, delta=huber_delta)
+        else:
+            XtX = X_win.T @ X_win + 1e-6 * jnp.eye(n_features)
+            XtY = X_win.T @ Y_win
+            W = jnp.linalg.solve(XtX, XtY)
+        
+        all_coefficients.append(W)
+        
+        # Apply adaptive threshold
+        W_flat = jnp.abs(W).ravel()
+        median = jnp.median(W_flat)
+        mad = jnp.median(jnp.abs(W_flat - median))
+        threshold = threshold_k * mad * 1.4826
+        mask = jnp.abs(W) < threshold
+        all_masks.append(mask)
+    
+    all_coefficients = jnp.stack(all_coefficients)  # (n_windows, n_features, n_outputs)
+    all_masks = jnp.stack(all_masks)
+    
+    # Analyze consistency of small coefficients
+    # For each coefficient, calculate fraction of windows where it's small
+    consistency = jnp.mean(all_masks, axis=0)  # (n_features, n_outputs)
+    
+    # Create forced group mask based on consistency
+    forced_group_mask = jnp.zeros((n_countries, n_tenors, n_features), dtype=bool)
+    
+    for feature in range(n_features):
+        for country in range(n_countries):
+            for tenor in range(n_tenors):
+                output_idx = country * n_tenors + tenor
+                # Mark for zeroing if consistently small across windows
+                if consistency[feature, output_idx] >= consistency_threshold:
+                    forced_group_mask = forced_group_mask.at[country, tenor, feature].set(True)
+    
+    # Additional group-level analysis
+    # Check if entire feature should be zeroed for a country (all tenors)
+    for feature in range(n_features):
+        for country in range(n_countries):
+            tenor_consistency = []
+            for tenor in range(n_tenors):
+                output_idx = country * n_tenors + tenor
+                tenor_consistency.append(consistency[feature, output_idx])
+            
+            # If all tenors show high consistency, enforce group constraint
+            if jnp.min(jnp.array(tenor_consistency)) >= consistency_threshold:
+                forced_group_mask = forced_group_mask.at[country, :, feature].set(True)
+    
+    analysis_results = {
+        'all_coefficients': all_coefficients,
+        'all_masks': all_masks,
+        'consistency': consistency,
+        'mean_coefficients': jnp.mean(all_coefficients, axis=0),
+        'std_coefficients': jnp.std(all_coefficients, axis=0),
+        'cv_coefficients': jnp.std(all_coefficients, axis=0) / (jnp.abs(jnp.mean(all_coefficients, axis=0)) + 1e-8)
+    }
+    
+    return forced_group_mask, analysis_results
+
+# ============= COMPREHENSIVE SLIDING WINDOW WITH DISCOVERED CONSTRAINTS =============
+
+def sliding_window_with_discovered_constraints(
+    X, Y, window_size, stride, n_countries, n_tenors,
+    discovery_params=None, method='penalty', use_huber=False, huber_delta=1.0,
+    penalty_strength=1e10):
+    """
+    Two-stage approach:
+    1. Discover sparsity pattern using adaptive thresholding across windows
+    2. Apply discovered constraints to final regression
+    """
+    
+    if discovery_params is None:
+        discovery_params = {
+            'threshold_k': 2.0,
+            'consistency_threshold': 0.8,
+            'use_huber': use_huber,
+            'huber_delta': huber_delta
+        }
+    
+    # Stage 1: Discover sparsity pattern
+    print("Stage 1: Discovering sparsity pattern...")
+    forced_group_mask, analysis = discover_group_sparsity_pattern(
+        X, Y, window_size, stride, n_countries, n_tenors, **discovery_params
+    )
+    
+    # Print discovered pattern
+    n_constrained = jnp.sum(forced_group_mask)
+    n_total = forced_group_mask.size
+    print(f"Discovered {n_constrained}/{n_total} ({100*n_constrained/n_total:.1f}%) coefficients to zero")
+    
+    # Stage 2: Apply constraints
+    print("\nStage 2: Applying discovered constraints...")
+    
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    # Process forced_group_mask for window-wise application
+    mask_reshaped = forced_group_mask.transpose(2, 0, 1).reshape(n_features, n_outputs)
+    masks = jnp.broadcast_to(mask_reshaped[None, :, :], (n_windows, n_features, n_outputs))
+    
+    # Extract windows
+    def get_window(start_idx):
+        X_win = jax.lax.dynamic_slice(X, (start_idx, 0), (window_size, n_features))
+        Y_win = jax.lax.dynamic_slice(Y, (start_idx, 0), (window_size, n_outputs))
+        return X_win, Y_win
+    
+    start_indices = jnp.arange(n_windows) * stride
+    X_wins, Y_wins = jax.vmap(get_window)(start_indices)
+    
+    if method == 'penalty':
+        if use_huber:
+            # Huber regression with penalty constraints
+            def solve_window(X_win, Y_win, mask):
+                # First solve unconstrained Huber regression
+                W = solve_huber_regression(X_win, Y_win, delta=huber_delta)
+                
+                # Then apply penalties for masked coefficients
+                # Vectorized approach
+                def apply_penalty_to_output(j):
+                    mask_j = mask[:, j]
+                    penalty_diag = jnp.where(mask_j, penalty_strength, 0.0)
+                    
+                    XtX = X_win.T @ X_win
+                    XtY = X_win.T @ Y_win[:, j]
+                    XtX_pen = XtX + jnp.diag(penalty_diag) + 1e-6 * jnp.eye(n_features)
+                    
+                    # Only re-solve if there are penalties
+                    return jax.lax.cond(
+                        jnp.any(mask_j),
+                        lambda: jnp.linalg.solve(XtX_pen, XtY),
+                        lambda: W[:, j]
+                    )
+                
+                W_penalized = jax.vmap(apply_penalty_to_output)(jnp.arange(n_outputs))
+                return W_penalized.T
+            
+            W_all = jax.vmap(solve_window)(X_wins, Y_wins, masks)
+        else:
+            # Standard OLS with penalties
+            def solve_window_ols(X_win, Y_win, mask):
+                XtX = X_win.T @ X_win + 1e-6 * jnp.eye(n_features)
+                XtY = X_win.T @ Y_win
+                
+                def solve_output(j):
+                    mask_j = mask[:, j]
+                    penalty_diag = jnp.where(mask_j, penalty_strength, 0.0)
+                    XtX_pen = XtX + jnp.diag(penalty_diag)
+                    return jnp.linalg.solve(XtX_pen, XtY[:, j])
+                
+                W = jax.vmap(solve_output)(jnp.arange(n_outputs))
+                return W.T
+            
+            W_all = jax.vmap(solve_window_ols)(X_wins, Y_wins, masks)
+    
+    else:  # KKT method
+        # Convert mask to constraints and use KKT (implementation from previous code)
+        # ... (omitted for brevity, use KKT implementation from before)
+        W_all = None  # Placeholder
+    
+    return W_all, masks, forced_group_mask, analysis
+
+# ============= VISUALIZATION =============
+
+def visualize_discovery_and_results(analysis, forced_group_mask, W_final, 
+                                   n_countries, n_tenors, true_W=None):
+    """Comprehensive visualization of the discovery process and results"""
+    
+    fig = plt.figure(figsize=(20, 16))
+    
+    # 1. Consistency heatmap
+    ax = plt.subplot(3, 4, 1)
+    consistency_reshaped = analysis['consistency'].T.reshape(n_countries, n_tenors, -1)
+    # Average over tenors to show by country
+    consistency_country = jnp.mean(consistency_reshaped, axis=1)
+    im = ax.imshow(consistency_country, cmap='RdYlBu_r', vmin=0, vmax=1)
+    ax.set_title('Consistency by Country\n(Fraction of windows with small coef)')
+    ax.set_xlabel('Feature')
+    ax.set_ylabel('Country')
+    plt.colorbar(im, ax=ax)
+    
+    # 2. Coefficient variation (CV)
+    ax = plt.subplot(3, 4, 2)
+    cv_reshaped = analysis['cv_coefficients'].T.reshape(n_countries, n_tenors, -1)
+    cv_country = jnp.mean(cv_reshaped, axis=1)
+    im = ax.imshow(jnp.log10(cv_country + 1e-8), cmap='viridis')
+    ax.set_title('log10(CV) by Country\n(Coefficient stability)')
+    ax.set_xlabel('Feature')
+    ax.set_ylabel('Country')
+    plt.colorbar(im, ax=ax)
+    
+    # 3. Discovered mask
+    ax = plt.subplot(3, 4, 3)
+    mask_visual = forced_group_mask.reshape(n_countries * n_tenors, -1).T
+    im = ax.imshow(mask_visual, cmap='RdBu_r', aspect='auto')
+    ax.set_title('Discovered Constraints\n(Red = Zero)')
+    ax.set_xlabel('Country-Tenor')
+    ax.set_ylabel('Feature')
+    plt.colorbar(im, ax=ax)
+    
+    # 4. Mean coefficients
+    ax = plt.subplot(3, 4, 4)
+    mean_coef = analysis['mean_coefficients']
+    im = ax.imshow(mean_coef, cmap='RdBu_r', vmin=-2, vmax=2)
+    ax.set_title('Mean Coefficients\n(Across windows)')
+    ax.set_xlabel('Output')
+    ax.set_ylabel('Feature')
+    plt.colorbar(im, ax=ax)
+    
+    # 5. Coefficient evolution for selected features
+    ax = plt.subplot(3, 4, 5)
+    n_windows = analysis['all_coefficients'].shape[0]
+    # Plot evolution for first 3 features, first output
+    for f in range(min(3, analysis['all_coefficients'].shape[1])):
+        ax.plot(analysis['all_coefficients'][:, f, 0], label=f'Feature {f}')
+    ax.set_xlabel('Window')
+    ax.set_ylabel('Coefficient Value')
+    ax.set_title('Coefficient Evolution\n(First output)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 6. Sparsity over windows
+    ax = plt.subplot(3, 4, 6)
+    sparsity_per_window = jnp.mean(analysis['all_masks'], axis=(1, 2))
+    ax.plot(sparsity_per_window, 'b-', linewidth=2)
+    ax.axhline(y=jnp.mean(forced_group_mask), color='r', linestyle='--', 
+               label=f'Final sparsity: {jnp.mean(forced_group_mask):.2f}')
+    ax.set_xlabel('Window')
+    ax.set_ylabel('Sparsity')
+    ax.set_title('Sparsity Evolution')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 7. Final coefficients
+    ax = plt.subplot(3, 4, 7)
+    W_final_avg = jnp.mean(W_final, axis=0)
+    im = ax.imshow(W_final_avg, cmap='RdBu_r', vmin=-2, vmax=2)
+    ax.set_title('Final Coefficients\n(With discovered constraints)')
+    ax.set_xlabel('Output')
+    ax.set_ylabel('Feature')
+    plt.colorbar(im, ax=ax)
+    
+    # 8. Violations
+    ax = plt.subplot(3, 4, 8)
+    mask_reshaped = forced_group_mask.transpose(2, 0, 1).reshape(W_final_avg.shape[0], -1)
+    violations = jnp.abs(W_final_avg) * mask_reshaped
+    im = ax.imshow(violations, cmap='Reds', vmin=0, vmax=0.1)
+    ax.set_title('Constraint Violations')
+    ax.set_xlabel('Output')
+    ax.set_ylabel('Feature')
+    plt.colorbar(im, ax=ax)
+    
+    # 9. Group structure visualization
+    ax = plt.subplot(3, 4, 9)
+    # Show which entire country-feature combinations are zeroed
+    country_feature_zeros = jnp.zeros((n_countries, W_final_avg.shape[0]))
+    for c in range(n_countries):
+        for f in range(W_final_avg.shape[0]):
+            # Check if all tenors are zeroed for this country-feature
+            if jnp.all(forced_group_mask[c, :, f]):
+                country_feature_zeros = country_feature_zeros.at[c, f].set(1)
+    
+    im = ax.imshow(country_feature_zeros, cmap='Reds', aspect='auto')
+    ax.set_title('Country-Feature Zeros\n(Entire row zeroed)')
+    ax.set_xlabel('Feature')
+    ax.set_ylabel('Country')
+    plt.colorbar(im, ax=ax)
+    
+    # 10-12: Comparison with truth if available
+    if true_W is not None:
+        # True coefficients
+        ax = plt.subplot(3, 4, 10)
+        im = ax.imshow(true_W, cmap='RdBu_r', vmin=-2, vmax=2)
+        ax.set_title('True Coefficients')
+        ax.set_xlabel('Output')
+        ax.set_ylabel('Feature')
+        plt.colorbar(im, ax=ax)
+        
+        # Error
+        ax = plt.subplot(3, 4, 11)
+        error = W_final_avg - true_W
+        im = ax.imshow(error, cmap='RdBu_r', vmin=-1, vmax=1)
+        ax.set_title('Estimation Error')
+        ax.set_xlabel('Output')
+        ax.set_ylabel('Feature')
+        plt.colorbar(im, ax=ax)
+        
+        # Performance metrics
+        ax = plt.subplot(3, 4, 12)
+        true_zeros = true_W == 0
+        discovered_zeros = mask_reshaped
+        
+        tp = jnp.sum(discovered_zeros & true_zeros)
+        fp = jnp.sum(discovered_zeros & ~true_zeros)
+        fn = jnp.sum(~discovered_zeros & true_zeros)
+        tn = jnp.sum(~discovered_zeros & ~true_zeros)
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        metrics = ['Precision', 'Recall', 'F1']
+        values = [precision, recall, f1]
+        bars = ax.bar(metrics, values)
+        ax.set_ylim([0, 1])
+        ax.set_title('Zero Detection Performance')
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                   f'{val:.3f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+
+# ============= DEMO WITH HUBER LOSS =============
+
+def demo_adaptive_discovery_with_huber():
+    """Demonstrate the complete framework with Huber loss"""
+    
+    # Generate data with outliers
+    key = jax.random.PRNGKey(42)
+    n_samples, n_features = 1500, 8
+    n_countries, n_tenors = 4, 6
+    n_outputs = n_countries * n_tenors
+    
+    # True coefficients with group structure
+    true_W = jnp.zeros((n_features, n_outputs))
+    
+    # Country 0: Features 0,1 active for all tenors
+    for t in range(n_tenors):
+        true_W = true_W.at[0, 0*n_tenors + t].set(1.5)
+        true_W = true_W.at[1, 0*n_tenors + t].set(-1.0)
+    
+    # Country 1: Features 2,3 active for first half of tenors
+    for t in range(n_tenors // 2):
+        true_W = true_W.at[2, 1*n_tenors + t].set(2.0)
+        true_W = true_W.at[3, 1*n_tenors + t].set(0.5)
+    
+    # Country 2: Feature 4 active for all tenors
+    for t in range(n_tenors):
+        true_W = true_W.at[4, 2*n_tenors + t].set(1.0)
+    
+    # Generate data
+    X = jax.random.normal(key, (n_samples, n_features))
+    Y_clean = X @ true_W
+    
+    # Add noise with outliers
+    noise = 0.1 * jax.random.normal(key, (n_samples, n_outputs))
+    # Add 5% outliers
+    outlier_mask = jax.random.uniform(key, (n_samples,)) < 0.05
+    outlier_noise = 5.0 * jax.random.normal(key, (n_samples, n_outputs))
+    noise = jnp.where(outlier_mask[:, None], outlier_noise, noise)
+    Y = Y_clean + noise
+    
+    window_size = 150
+    stride = 75
+    
+    print("="*80)
+    print("DEMO: Adaptive Discovery with Huber Loss")
+    print("="*80)
+    
+    # Compare methods
+    methods = {
+        'OLS': {
+            'use_huber': False,
+            'discovery_params': {'threshold_k': 2.0, 'consistency_threshold': 0.8}
+        },
+        'Huber': {
+            'use_huber': True,
+            'huber_delta': 1.0,
+            'discovery_params': {'threshold_k': 2.0, 'consistency_threshold': 0.8, 
+                               'use_huber': True, 'huber_delta': 1.0}
+        }
+    }
+    
+    results = {}
+    
+    for method_name, params in methods.items():
+        print(f"\n{method_name} Method:")
+        print("-"*40)
+        
+        start_time = time.time()
+        
+        W_all, masks, forced_group_mask, analysis = sliding_window_with_discovered_constraints(
+            X, Y, window_size, stride, n_countries, n_tenors,
+            method='penalty',
+            **params
+        )
+        
+        elapsed = time.time() - start_time
+        
+        # Calculate R²
+        r2_list = []
+        for i in range(W_all.shape[0]):
+            start = i * stride
+            end = start + window_size
+            Y_pred = X[start:end] @ W_all[i]
+            r2 = 1 - jnp.sum((Y[start:end] - Y_pred)**2) / jnp.sum((Y[start:end] - jnp.mean(Y[start:end]))**2)
+            r2_list.append(r2)
+        
+        results[method_name] = {
+            'W': W_all,
+            'mask': forced_group_mask,
+            'analysis': analysis,
+            'r2': jnp.array(r2_list),
+            'time': elapsed
+        }
+        
+        print(f"Time: {elapsed:.2f}s")
+        print(f"Average R²: {jnp.mean(jnp.array(r2_list)):.4f}")
+        print(f"Discovered sparsity: {100*jnp.mean(forced_group_mask):.1f}%")
+    
+    # Visualize comparison
+    print("\nVisualizing results...")
+    
+    # Create comparison plot
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    for idx, (method_name, result) in enumerate(results.items()):
+        # Discovered mask
+        ax = axes[0, idx]
+        mask_visual = result['mask'].reshape(n_countries * n_tenors, -1).T
+        im = ax.imshow(mask_visual, cmap='Reds', aspect='auto')
+        ax.set_title(f'{method_name}: Discovered Zeros')
+        ax.set_xlabel('Country-Tenor')
+        ax.set_ylabel('Feature')
+        
+        # R² over time
+        ax = axes[1, idx]
+        ax.plot(result['r2'], linewidth=2)
+        ax.set_xlabel('Window')
+        ax.set_ylabel('R²')
+        ax.set_title(f'{method_name}: R² = {jnp.mean(result["r2"]):.3f}')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1])
+    
+    # Comparison
+    ax = axes[0, 2]
+    ax.bar(['OLS', 'Huber'], 
+           [jnp.mean(results['OLS']['r2']), jnp.mean(results['Huber']['r2'])])
+    ax.set_ylabel('Average R²')
+    ax.set_title('Performance Comparison')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    ax = axes[1, 2]
+    ax.bar(['OLS', 'Huber'], 
+           [jnp.mean(results['OLS']['mask']), jnp.mean(results['Huber']['mask'])])
+    ax.set_ylabel('Sparsity')
+    ax.set_title('Discovered Sparsity')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Detailed visualization for Huber method
+    print("\nDetailed analysis for Huber method:")
+    visualize_discovery_and_results(
+        results['Huber']['analysis'],
+        results['Huber']['mask'],
+        results['Huber']['W'],
+        n_countries, n_tenors,
+        true_W
+    )
+
+# Run the demo
+if __name__ == "__main__":
+    demo_adaptive_discovery_with_huber()
