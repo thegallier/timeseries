@@ -2454,3 +2454,553 @@ if __name__ == "__main__":
     # Visualize
     print("\nVisualizing results...")
     plot_efficient_results(results[2])  # Plot the third result
+
+
+/=== vectorize 2
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import time
+
+# ============= METHOD 1: PENALTY-BASED APPROACH =============
+
+def apply_offsetting_constraint_penalty(X, Y, window_size, stride, n_countries, n_tenors,
+                                       hedge_indices=(2, 4), penalty_strength=1e8):
+    """
+    Apply offsetting constraint using penalty method.
+    Forces hedge_indices[0] + hedge_indices[1] = 0 for all outputs.
+    
+    Args:
+        X: Input data (n_samples, n_features)
+        Y: Output data (n_samples, n_outputs)
+        hedge_indices: Tuple of (idx1, idx2) for hedges that should offset
+        penalty_strength: How strongly to enforce the constraint
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    print(f"Penalty method: {n_windows} windows, enforcing hedge {hedge_indices[0]} + hedge {hedge_indices[1]} = 0")
+    
+    # Pre-allocate results
+    W_all = np.zeros((n_windows, n_features, n_outputs))
+    violations = []
+    
+    for i in range(n_windows):
+        start_idx = i * stride
+        end_idx = start_idx + window_size
+        
+        X_win = jnp.array(X[start_idx:end_idx])
+        Y_win = jnp.array(Y[start_idx:end_idx])
+        
+        # Augment system with constraint
+        # We want w[idx1] + w[idx2] = 0 for all outputs
+        # This is equivalent to minimizing (w[idx1] + w[idx2])^2
+        
+        XtX = X_win.T @ X_win
+        XtY = X_win.T @ Y_win
+        
+        # Add penalty term to enforce constraint
+        # The penalty adds penalty_strength to the diagonal for the constrained coefficients
+        # and penalty_strength to the off-diagonal between them
+        penalty_matrix = jnp.zeros((n_features, n_features))
+        idx1, idx2 = hedge_indices
+        penalty_matrix = penalty_matrix.at[idx1, idx1].add(penalty_strength)
+        penalty_matrix = penalty_matrix.at[idx2, idx2].add(penalty_strength)
+        penalty_matrix = penalty_matrix.at[idx1, idx2].add(penalty_strength)
+        penalty_matrix = penalty_matrix.at[idx2, idx1].add(penalty_strength)
+        
+        # Solve with penalty
+        XtX_pen = XtX + penalty_matrix + 1e-6 * jnp.eye(n_features)
+        W = jnp.linalg.solve(XtX_pen, XtY)
+        
+        W_all[i] = W
+        
+        # Check constraint violation
+        violation = jnp.abs(W[idx1, :] + W[idx2, :])
+        violations.append(jnp.max(violation))
+    
+    W_all = jnp.array(W_all)
+    
+    print(f"Max constraint violation: {max(violations):.2e}")
+    print(f"Mean constraint violation: {np.mean(violations):.2e}")
+    
+    return {
+        'W_all': W_all,
+        'W_avg': jnp.mean(W_all, axis=0),
+        'violations': violations,
+        'method': 'penalty'
+    }
+
+# ============= METHOD 2: KKT CONDITIONS (EXACT) =============
+
+def apply_offsetting_constraint_kkt(X, Y, window_size, stride, n_countries, n_tenors,
+                                   hedge_indices=(2, 4)):
+    """
+    Apply offsetting constraint using KKT conditions (exact method).
+    This eliminates one variable and solves the reduced system.
+    
+    Args:
+        X: Input data (n_samples, n_features)
+        Y: Output data (n_samples, n_outputs)
+        hedge_indices: Tuple of (idx1, idx2) for hedges that should offset
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    idx1, idx2 = hedge_indices
+    print(f"KKT method: {n_windows} windows, enforcing hedge {idx1} + hedge {idx2} = 0")
+    
+    # Pre-allocate results
+    W_all = np.zeros((n_windows, n_features, n_outputs))
+    
+    for i in range(n_windows):
+        start_idx = i * stride
+        end_idx = start_idx + window_size
+        
+        X_win = np.array(X[start_idx:end_idx])
+        Y_win = np.array(Y[start_idx:end_idx])
+        
+        # Method: Eliminate w[idx2] = -w[idx1]
+        # Create reduced design matrix by combining columns
+        X_reduced = np.zeros((window_size, n_features - 1))
+        
+        # Map original indices to reduced indices
+        reduced_idx = 0
+        idx_mapping = {}
+        
+        for j in range(n_features):
+            if j == idx2:
+                continue  # Skip the eliminated variable
+            elif j == idx1:
+                # Combine columns: X[:, idx1] - X[:, idx2]
+                X_reduced[:, reduced_idx] = X_win[:, idx1] - X_win[:, idx2]
+                idx_mapping[j] = reduced_idx
+                reduced_idx += 1
+            else:
+                X_reduced[:, reduced_idx] = X_win[:, j]
+                idx_mapping[j] = reduced_idx
+                reduced_idx += 1
+        
+        # Solve reduced system
+        XtX_red = X_reduced.T @ X_reduced
+        XtY_red = X_reduced.T @ Y_win
+        W_reduced = jnp.linalg.solve(XtX_red + 1e-6 * jnp.eye(n_features - 1), XtY_red)
+        
+        # Reconstruct full coefficient matrix
+        W = jnp.zeros((n_features, n_outputs))
+        for j in range(n_features):
+            if j == idx2:
+                W = W.at[j, :].set(-W_reduced[idx_mapping[idx1], :])
+            elif j in idx_mapping:
+                W = W.at[j, :].set(W_reduced[idx_mapping[j], :])
+        
+        W_all[i] = W
+        
+        # Verify constraint (should be ~0)
+        if i == 0:
+            violation = jnp.abs(W[idx1, :] + W[idx2, :])
+            print(f"  First window constraint check: max violation = {jnp.max(violation):.2e}")
+    
+    W_all = jnp.array(W_all)
+    
+    return {
+        'W_all': W_all,
+        'W_avg': jnp.mean(W_all, axis=0),
+        'violations': [0.0] * n_windows,  # Exact method has zero violations
+        'method': 'kkt'
+    }
+
+# ============= METHOD 3: AUGMENTED SYSTEM =============
+
+def apply_offsetting_constraint_augmented(X, Y, window_size, stride, n_countries, n_tenors,
+                                         hedge_indices=(2, 4)):
+    """
+    Apply offsetting constraint using augmented system with Lagrange multipliers.
+    Solves the system exactly by including constraint in the linear system.
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    idx1, idx2 = hedge_indices
+    print(f"Augmented method: {n_windows} windows, enforcing hedge {idx1} + hedge {idx2} = 0")
+    
+    # Pre-allocate results
+    W_all = np.zeros((n_windows, n_features, n_outputs))
+    
+    for i in range(n_windows):
+        start_idx = i * stride
+        end_idx = start_idx + window_size
+        
+        X_win = jnp.array(X[start_idx:end_idx])
+        Y_win = jnp.array(Y[start_idx:end_idx])
+        
+        # For each output, solve augmented system
+        W = jnp.zeros((n_features, n_outputs))
+        
+        for j in range(n_outputs):
+            # Build augmented system:
+            # [X'X   c] [w]   = [X'y]
+            # [c'    0] [λ]     [0]
+            # where c is constraint vector (zeros except 1 at idx1 and idx2)
+            
+            XtX = X_win.T @ X_win
+            Xty = X_win.T @ Y_win[:, j]
+            
+            # Constraint vector
+            c = jnp.zeros(n_features)
+            c = c.at[idx1].set(1.0)
+            c = c.at[idx2].set(1.0)
+            
+            # Build augmented matrix
+            aug_size = n_features + 1
+            A = jnp.zeros((aug_size, aug_size))
+            A = A.at[:n_features, :n_features].set(XtX + 1e-6 * jnp.eye(n_features))
+            A = A.at[:n_features, -1].set(c)
+            A = A.at[-1, :n_features].set(c)
+            
+            # Build augmented RHS
+            b = jnp.zeros(aug_size)
+            b = b.at[:n_features].set(Xty)
+            
+            # Solve
+            sol = jnp.linalg.solve(A, b)
+            W = W.at[:, j].set(sol[:n_features])
+        
+        W_all[i] = W
+    
+    W_all = jnp.array(W_all)
+    
+    return {
+        'W_all': W_all,
+        'W_avg': jnp.mean(W_all, axis=0),
+        'violations': [0.0] * n_windows,  # Exact method
+        'method': 'augmented'
+    }
+
+# ============= COMBINED WITH DISCOVERY =============
+
+def constrained_sliding_discovery(X, Y, window_size, stride, n_countries, n_tenors,
+                                 hedge_indices=(2, 4), method='kkt',
+                                 discovery_config=None,
+                                 forced_group_mask=None):
+    """
+    Combine offsetting constraint with zero discovery.
+    
+    Args:
+        method: 'kkt', 'penalty', or 'augmented'
+        Other args same as before
+    """
+    if discovery_config is None:
+        discovery_config = {
+            'consistency_threshold': 0.9,
+            'magnitude_threshold': 0.05,
+            'relative_threshold': 0.1,
+            'check_relative': True
+        }
+    
+    # First, run unconstrained discovery to identify zeros
+    print("Phase 1: Discovering zero patterns...")
+    discovery_result = fast_sliding_discovery(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        forced_group_mask=forced_group_mask,
+        discovery_config=discovery_config
+    )
+    
+    combined_mask = discovery_result['combined_mask']
+    
+    # Apply both constraints
+    print(f"\nPhase 2: Applying constraints (offsetting + discovered zeros)...")
+    
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    W_all = np.zeros((n_windows, n_features, n_outputs))
+    idx1, idx2 = hedge_indices
+    
+    # Flatten the mask
+    mask_flat = combined_mask.transpose(2, 0, 1).reshape(n_features, n_outputs)
+    
+    for i in range(n_windows):
+        start_idx = i * stride
+        end_idx = start_idx + window_size
+        
+        X_win = jnp.array(X[start_idx:end_idx])
+        Y_win = jnp.array(Y[start_idx:end_idx])
+        
+        if method == 'kkt':
+            # Use KKT for offsetting + penalty for zeros
+            # First apply offsetting constraint via variable elimination
+            X_reduced = np.zeros((window_size, n_features - 1))
+            reduced_idx = 0
+            idx_mapping = {}
+            
+            for j in range(n_features):
+                if j == idx2:
+                    continue
+                elif j == idx1:
+                    X_reduced[:, reduced_idx] = X_win[:, idx1] - X_win[:, idx2]
+                    idx_mapping[j] = reduced_idx
+                    reduced_idx += 1
+                else:
+                    X_reduced[:, reduced_idx] = X_win[:, j]
+                    idx_mapping[j] = reduced_idx
+                    reduced_idx += 1
+            
+            # Solve each output with zero constraints
+            W = jnp.zeros((n_features, n_outputs))
+            
+            for out_idx in range(n_outputs):
+                # Build penalty for zeros in reduced system
+                penalty_diag_reduced = jnp.zeros(n_features - 1)
+                
+                for j in range(n_features):
+                    if j in idx_mapping and mask_flat[j, out_idx]:
+                        penalty_diag_reduced = penalty_diag_reduced.at[idx_mapping[j]].set(1e10)
+                
+                XtX_red = X_reduced.T @ X_reduced
+                Xty_red = X_reduced.T @ Y_win[:, out_idx]
+                
+                XtX_pen = XtX_red + jnp.diag(penalty_diag_reduced) + 1e-6 * jnp.eye(n_features - 1)
+                w_reduced = jnp.linalg.solve(XtX_pen, Xty_red)
+                
+                # Reconstruct
+                for j in range(n_features):
+                    if j == idx2:
+                        W = W.at[j, out_idx].set(-w_reduced[idx_mapping[idx1]])
+                    elif j in idx_mapping:
+                        W = W.at[j, out_idx].set(w_reduced[idx_mapping[j]])
+            
+            W_all[i] = W
+            
+        elif method == 'penalty':
+            # Use penalties for both constraints
+            XtX = X_win.T @ X_win
+            XtY = X_win.T @ Y_win
+            
+            # Offsetting penalty
+            offset_penalty = jnp.zeros((n_features, n_features))
+            offset_penalty = offset_penalty.at[idx1, idx1].add(1e8)
+            offset_penalty = offset_penalty.at[idx2, idx2].add(1e8)
+            offset_penalty = offset_penalty.at[idx1, idx2].add(1e8)
+            offset_penalty = offset_penalty.at[idx2, idx1].add(1e8)
+            
+            # Solve each output
+            W = jnp.zeros((n_features, n_outputs))
+            for j in range(n_outputs):
+                # Zero penalties for this output
+                zero_penalty = jnp.diag(jnp.where(mask_flat[:, j], 1e10, 0.0))
+                
+                XtX_pen = XtX + offset_penalty + zero_penalty + 1e-6 * jnp.eye(n_features)
+                W = W.at[:, j].set(jnp.linalg.solve(XtX_pen, XtY[:, j]))
+            
+            W_all[i] = W
+    
+    W_all = jnp.array(W_all)
+    
+    # Check violations
+    offset_violations = []
+    zero_violations = []
+    
+    for i in range(n_windows):
+        # Offsetting violation
+        offset_viol = jnp.max(jnp.abs(W_all[i, idx1, :] + W_all[i, idx2, :]))
+        offset_violations.append(offset_viol)
+        
+        # Zero violations
+        zero_viol = jnp.max(jnp.abs(W_all[i] * mask_flat))
+        zero_violations.append(zero_viol)
+    
+    print(f"\nConstraint violations:")
+    print(f"  Offsetting: max={max(offset_violations):.2e}, mean={np.mean(offset_violations):.2e}")
+    print(f"  Zeros: max={max(zero_violations):.2e}, mean={np.mean(zero_violations):.2e}")
+    
+    return {
+        'W_all': W_all,
+        'W_avg': jnp.mean(W_all, axis=0),
+        'combined_mask': combined_mask,
+        'discovery_mask': discovery_result['discovery_mask'],
+        'offset_violations': offset_violations,
+        'zero_violations': zero_violations,
+        'method': method
+    }
+
+# ============= EXAMPLE USAGE =============
+
+def example_usage():
+    """Example showing how to use these methods with your data structure"""
+    
+    # Your data dimensions
+    n_samples = 1256
+    n_hedges = 7  # features
+    n_countries = 14
+    n_tenors = 12
+    n_outputs = n_countries * n_tenors  # 168
+    
+    # Window parameters
+    window_size = 200
+    stride = 50
+    
+    print(f"Data: {n_samples} samples, {n_hedges} hedges, {n_outputs} outputs")
+    print(f"Windows: size={window_size}, stride={stride}")
+    print(f"Constraint: hedge 3 + hedge 5 = 0 (indices 2 and 4)")
+    
+    # Generate example data (replace with your actual data)
+    key = jax.random.PRNGKey(42)
+    X = jax.random.normal(key, (n_samples, n_hedges))
+    
+    # Create some structure in true coefficients
+    W_true = jnp.zeros((n_hedges, n_outputs))
+    # Make hedges 2 and 4 offsetting
+    for i in range(n_outputs):
+        if i % 3 == 0:
+            W_true = W_true.at[2, i].set(1.5)
+            W_true = W_true.at[4, i].set(-1.5)
+    
+    # Add other non-zero coefficients
+    W_true = W_true.at[0, :50].set(2.0)
+    W_true = W_true.at[1, 50:100].set(-1.0)
+    W_true = W_true.at[6, 100:].set(0.8)
+    
+    # Generate outputs
+    Y = X @ W_true + 0.1 * jax.random.normal(key, (n_samples, n_outputs))
+    
+    # Method 1: Penalty approach
+    print("\n" + "="*60)
+    print("METHOD 1: PENALTY APPROACH")
+    print("="*60)
+    
+    result_penalty = apply_offsetting_constraint_penalty(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        hedge_indices=(2, 4),
+        penalty_strength=1e10
+    )
+    
+    # Method 2: KKT approach (exact)
+    print("\n" + "="*60)
+    print("METHOD 2: KKT APPROACH (EXACT)")
+    print("="*60)
+    
+    result_kkt = apply_offsetting_constraint_kkt(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        hedge_indices=(2, 4)
+    )
+    
+    # Method 3: Combined with discovery
+    print("\n" + "="*60)
+    print("METHOD 3: COMBINED WITH DISCOVERY")
+    print("="*60)
+    
+    # You can specify prior knowledge about which coefficients should be zero
+    forced_mask = jnp.zeros((n_countries, n_tenors, n_hedges), dtype=bool)
+    # Example: force hedge 6 to be zero for first 2 countries
+    forced_mask = forced_mask.at[:2, :, 6].set(True)
+    
+    result_combined = constrained_sliding_discovery(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        hedge_indices=(2, 4),
+        method='kkt',
+        forced_group_mask=forced_mask,
+        discovery_config={
+            'consistency_threshold': 0.85,
+            'magnitude_threshold': 0.08,
+            'relative_threshold': 0.1,
+            'check_relative': True
+        }
+    )
+    
+    # Compare results
+    print("\n" + "="*60)
+    print("RESULTS COMPARISON")
+    print("="*60)
+    
+    for name, result in [('Penalty', result_penalty), 
+                        ('KKT', result_kkt), 
+                        ('Combined', result_combined)]:
+        W_avg = result['W_avg']
+        
+        # Check offsetting constraint
+        offset_check = W_avg[2, :] + W_avg[4, :]
+        print(f"\n{name} Method:")
+        print(f"  Max offsetting violation: {jnp.max(jnp.abs(offset_check)):.2e}")
+        print(f"  Mean |w[2]|: {jnp.mean(jnp.abs(W_avg[2, :])):.3f}")
+        print(f"  Mean |w[4]|: {jnp.mean(jnp.abs(W_avg[4, :])):.3f}")
+        
+        # Performance
+        Y_pred = X @ W_avg
+        r2 = 1 - jnp.sum((Y - Y_pred)**2) / jnp.sum((Y - jnp.mean(Y))**2)
+        print(f"  R²: {r2:.4f}")
+        
+        if 'combined_mask' in result:
+            sparsity = jnp.mean(result['combined_mask'])
+            print(f"  Sparsity: {100*sparsity:.1f}%")
+    
+    return result_penalty, result_kkt, result_combined
+
+# ============= VISUALIZATION FOR OFFSETTING CONSTRAINTS =============
+
+def visualize_offsetting_results(results_dict, hedge_indices=(2, 4)):
+    """Visualize results focusing on the offsetting constraint"""
+    
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(2, len(results_dict), figsize=(5*len(results_dict), 8))
+    if len(results_dict) == 1:
+        axes = axes.reshape(-1, 1)
+    
+    idx1, idx2 = hedge_indices
+    
+    for i, (name, result) in enumerate(results_dict.items()):
+        W_avg = result['W_avg']
+        
+        # Plot 1: Coefficients for constrained hedges
+        ax = axes[0, i]
+        ax.plot(W_avg[idx1, :], 'b-', label=f'Hedge {idx1+1}', linewidth=2)
+        ax.plot(W_avg[idx2, :], 'r-', label=f'Hedge {idx2+1}', linewidth=2)
+        ax.plot(W_avg[idx1, :] + W_avg[idx2, :], 'k--', 
+                label='Sum (should be 0)', linewidth=1)
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.set_xlabel('Output Index')
+        ax.set_ylabel('Coefficient Value')
+        ax.set_title(f'{name}: Offsetting Hedges')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Violation over windows
+        ax = axes[1, i]
+        if 'violations' in result and result['violations']:
+            ax.semilogy(result['violations'], 'g-', linewidth=2)
+            ax.set_xlabel('Window Index')
+            ax.set_ylabel('Constraint Violation (log)')
+            ax.set_title('Offsetting Violation Over Time')
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'No violation data', 
+                   ha='center', va='center', transform=ax.transAxes)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
+# Load the helper functions from the original code
+# from paste import fast_sliding_discovery, visualize_discovery_results
+
+if __name__ == "__main__":
+    # Run example
+    results = example_usage()
+    
+    # Visualize
+    print("\n" + "="*60)
+    print("VISUALIZATION")
+    print("="*60)
+    
+    visualize_offsetting_results({
+        'Penalty': results[0],
+        'KKT': results[1],
+        'Combined': results[2]
+    })
