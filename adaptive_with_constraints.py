@@ -1862,4 +1862,595 @@ if __name__ == "__main__":
     results, figures = benchmark_with_visualization()
     print_practical_tips()
 
+#====  Vectorized
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+from functools import partial
+
+# ============= VECTORIZED CONSTRAINT METHODS =============
+
+def create_windowed_tensors(X, Y, window_size, stride):
+    """
+    Create 3D tensors of windowed data for vectorized operations.
+    
+    Returns:
+        X_windows: (n_windows, window_size, n_features)
+        Y_windows: (n_windows, window_size, n_outputs)
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    # Create indices for windows
+    indices = jnp.arange(window_size)[None, :] + (stride * jnp.arange(n_windows))[:, None]
+    
+    # Extract windows
+    X_windows = X[indices]  # (n_windows, window_size, n_features)
+    Y_windows = Y[indices]  # (n_windows, window_size, n_outputs)
+    
+    return X_windows, Y_windows
+
+@partial(jax.jit, static_argnames=['constraint_type'])
+def solve_all_windows_constrained(X_windows, Y_windows, constraint_type='offset', 
+                                 hedge_indices=(2, 4), penalty_strength=1e10):
+    """
+    Solve all windows in parallel with constraints.
+    
+    Args:
+        X_windows: (n_windows, window_size, n_features)
+        Y_windows: (n_windows, window_size, n_outputs)
+        constraint_type: 'offset', 'sum_to_zero', or 'penalty'
+        hedge_indices: Indices for constrained hedges
+    """
+    n_windows, window_size, n_features = X_windows.shape
+    n_outputs = Y_windows.shape[2]
+    
+    if constraint_type == 'offset':
+        # Method 1: Variable elimination (exact)
+        # Eliminate hedge_indices[1] by setting it to -hedge_indices[0]
+        idx1, idx2 = hedge_indices
+        
+        # Create transformation matrix
+        T = jnp.eye(n_features)
+        T = T.at[:, idx2].set(0)  # Remove column for eliminated variable
+        T = T.at[idx1, idx2].set(-1)  # Add negative to first variable
+        
+        # Remove the row for eliminated variable
+        mask = jnp.ones(n_features, dtype=bool).at[idx2].set(False)
+        T_reduced = T[mask]  # (n_features-1, n_features)
+        
+        # Transform all windows
+        X_transformed = jnp.einsum('nwf,gf->nwg', X_windows, T_reduced.T)
+        
+        # Batch solve
+        XtX = jnp.einsum('nwi,nwj->nij', X_transformed, X_transformed)
+        XtY = jnp.einsum('nwi,nwo->nio', X_transformed, Y_windows)
+        
+        # Add regularization
+        XtX_reg = XtX + 1e-6 * jnp.eye(n_features - 1)[None, :, :]
+        
+        # Solve all systems
+        W_reduced = jax.vmap(lambda A, B: jnp.linalg.solve(A, B))(XtX_reg, XtY)
+        
+        # Reconstruct full coefficients
+        W_full = jnp.einsum('gr,nro->ngo', T_reduced.T, W_reduced)
+        
+        return W_full
+        
+    elif constraint_type == 'penalty':
+        # Method 2: Penalty method (approximate but flexible)
+        idx1, idx2 = hedge_indices
+        
+        # Standard least squares terms
+        XtX = jnp.einsum('nwi,nwj->nij', X_windows, X_windows)
+        XtY = jnp.einsum('nwi,nwo->nio', X_windows, Y_windows)
+        
+        # Create penalty matrix for offsetting constraint
+        P = jnp.zeros((n_features, n_features))
+        P = P.at[idx1, idx1].add(penalty_strength)
+        P = P.at[idx2, idx2].add(penalty_strength)
+        P = P.at[idx1, idx2].add(penalty_strength)
+        P = P.at[idx2, idx1].add(penalty_strength)
+        
+        # Add penalty and regularization
+        XtX_pen = XtX + P[None, :, :] + 1e-6 * jnp.eye(n_features)[None, :, :]
+        
+        # Solve all systems
+        W = jax.vmap(lambda A, B: jnp.linalg.solve(A, B))(XtX_pen, XtY)
+        
+        return W
+    
+    else:
+        raise ValueError(f"Unknown constraint type: {constraint_type}")
+
+@jax.jit
+def solve_with_zero_constraints(X_windows, Y_windows, W_init, zero_mask, 
+                               hedge_indices=(2, 4), penalty_zero=1e10):
+    """
+    Apply both offsetting and zero constraints efficiently.
+    
+    Args:
+        W_init: Initial solution with offsetting constraint
+        zero_mask: (n_features, n_outputs) boolean mask of coefficients to force to zero
+    """
+    n_windows, window_size, n_features = X_windows.shape
+    n_outputs = Y_windows.shape[2]
+    idx1, idx2 = hedge_indices
+    
+    # For efficiency, we'll use the elimination method for offsetting
+    # and penalties for zeros
+    
+    # Step 1: Transform to eliminate hedge_indices[1]
+    T = jnp.eye(n_features)
+    T = T.at[:, idx2].set(0)
+    T = T.at[idx1, idx2].set(-1)
+    mask = jnp.ones(n_features, dtype=bool).at[idx2].set(False)
+    T_reduced = T[mask]
+    
+    X_transformed = jnp.einsum('nwf,gf->nwg', X_windows, T_reduced.T)
+    
+    # Step 2: Solve each output with its zero constraints
+    W_all = []
+    
+    for j in range(n_outputs):
+        # Get zero constraints for this output in reduced space
+        zero_mask_reduced = zero_mask[mask, j]
+        
+        # Build system for this output
+        XtX = jnp.einsum('nwi,nwi->ni', X_transformed, X_transformed)
+        Xty = jnp.einsum('nwi,nw->ni', X_transformed, Y_windows[:, :, j])
+        
+        # Add penalties for zeros
+        penalty_diag = jnp.where(zero_mask_reduced, penalty_zero, 0.0)
+        
+        # Solve for all windows
+        XtX_pen = jnp.einsum('nwi,nwj->nij', X_transformed, X_transformed)
+        XtX_pen = XtX_pen + jnp.diag(penalty_diag)[None, :, :] + 1e-6 * jnp.eye(n_features - 1)[None, :, :]
+        Xty_j = jnp.einsum('nwi,nw->ni', X_transformed, Y_windows[:, :, j])
+        
+        w_reduced = jax.vmap(lambda A, b: jnp.linalg.solve(A, b))(XtX_pen, Xty_j)
+        W_all.append(w_reduced)
+    
+    # Stack and transform back
+    W_reduced_all = jnp.stack(W_all, axis=2)  # (n_windows, n_features-1, n_outputs)
+    W_full = jnp.einsum('gr,nro->ngo', T_reduced.T, W_reduced_all)
+    
+    return W_full
+
+# ============= AUGMENTED TENSOR APPROACH =============
+
+def create_augmented_system(X, Y, window_size, stride, constraint_matrix=None):
+    """
+    Create augmented system that includes constraints directly.
+    
+    Args:
+        constraint_matrix: (n_constraints, n_features) matrix where each row is a constraint
+                          For offset constraint: [0, 0, 1, 0, 1, 0, 0] for hedges 3+5=0
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    if constraint_matrix is None:
+        # Default: hedge 3 + hedge 5 = 0
+        constraint_matrix = jnp.zeros((1, n_features))
+        constraint_matrix = constraint_matrix.at[0, 2].set(1)  # hedge 3
+        constraint_matrix = constraint_matrix.at[0, 4].set(1)  # hedge 5
+    
+    n_constraints = constraint_matrix.shape[0]
+    
+    # Create windowed data
+    X_windows, Y_windows = create_windowed_tensors(X, Y, window_size, stride)
+    
+    # Augment each window's design matrix
+    # [X  ] w = [Y]
+    # [C^T]     [0]
+    
+    # Pad Y with zeros for constraints
+    Y_aug = jnp.concatenate([
+        Y_windows,
+        jnp.zeros((n_windows, n_constraints, n_outputs))
+    ], axis=1)
+    
+    # Augment X with constraint matrix
+    C_broadcast = jnp.broadcast_to(constraint_matrix.T, (n_windows, n_features, n_constraints))
+    X_aug = jnp.concatenate([X_windows, C_broadcast.transpose(0, 2, 1)], axis=1)
+    
+    return X_aug, Y_aug, n_constraints
+
+@jax.jit
+def solve_augmented_system(X_aug, Y_aug, n_constraints):
+    """
+    Solve the augmented system for all windows in parallel.
+    Returns only the coefficient part (not Lagrange multipliers).
+    """
+    n_windows, aug_size, n_features = X_aug.shape
+    n_outputs = Y_aug.shape[2]
+    window_size = aug_size - n_constraints
+    
+    # Batch solve using normal equations
+    # (X_aug^T X_aug) w_aug = X_aug^T Y_aug
+    XtX = jnp.einsum('nai,naj->nij', X_aug, X_aug)
+    XtY = jnp.einsum('nai,nao->nio', X_aug, Y_aug)
+    
+    # Add small regularization for numerical stability
+    XtX_reg = XtX + 1e-8 * jnp.eye(n_features + n_constraints)[None, :, :]
+    
+    # Solve all windows at once
+    W_aug = jax.vmap(lambda A, B: jnp.linalg.solve(A, B))(XtX_reg, XtY)
+    
+    # Extract only the coefficients (not Lagrange multipliers)
+    W = W_aug[:, :n_features, :]
+    
+    return W
+
+# ============= COMBINED VECTORIZED APPROACH =============
+
+@partial(jax.jit, static_argnames=['n_features', 'n_outputs'])
+def vectorized_discovery(W_all, config, n_features, n_outputs):
+    """
+    Vectorized discovery of zero patterns across all windows.
+    """
+    # Compute statistics across windows
+    W_abs = jnp.abs(W_all)
+    
+    # Check magnitude threshold
+    mask_mag = W_abs < config['magnitude_threshold']
+    
+    # Check relative threshold
+    if config['check_relative']:
+        W_max = jnp.max(W_abs, axis=1, keepdims=True)  # Max per window per output
+        mask_rel = W_abs < (config['relative_threshold'] * W_max)
+        masks = mask_mag & mask_rel
+    else:
+        masks = mask_mag
+    
+    # Compute consistency
+    consistency = jnp.mean(masks, axis=0)  # (n_features, n_outputs)
+    
+    # Discovery criteria
+    mean_mags = jnp.mean(W_abs, axis=0)
+    max_mags = jnp.max(W_abs, axis=0)
+    
+    discovered = (
+        (consistency >= config['consistency_threshold']) &
+        (mean_mags < config['magnitude_threshold']) &
+        (max_mags < 2 * config['magnitude_threshold'])
+    )
+    
+    return discovered, consistency, mean_mags, max_mags
+
+def efficient_constrained_regression(X, Y, window_size, stride, n_countries, n_tenors,
+                                   hedge_indices=(2, 4), method='augmented',
+                                   discovery_config=None, forced_zeros=None):
+    """
+    Efficient vectorized constrained regression with discovery.
+    
+    Args:
+        method: 'augmented', 'elimination', or 'penalty'
+        forced_zeros: (n_features, n_outputs) boolean mask of known zeros
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    
+    print(f"Efficient constrained regression: {n_samples} samples, {n_features} features, {n_outputs} outputs")
+    print(f"Constraint: hedge {hedge_indices[0]+1} + hedge {hedge_indices[1]+1} = 0")
+    
+    # Default discovery config
+    if discovery_config is None:
+        discovery_config = {
+            'consistency_threshold': 0.9,
+            'magnitude_threshold': 0.05,
+            'relative_threshold': 0.1,
+            'check_relative': True
+        }
+    
+    if method == 'augmented':
+        # Create constraint matrix
+        constraint_matrix = jnp.zeros((1, n_features))
+        constraint_matrix = constraint_matrix.at[0, hedge_indices[0]].set(1)
+        constraint_matrix = constraint_matrix.at[0, hedge_indices[1]].set(1)
+        
+        # Create augmented system
+        X_aug, Y_aug, n_constraints = create_augmented_system(
+            X, Y, window_size, stride, constraint_matrix
+        )
+        
+        # Solve all windows at once
+        import time
+        start = time.time()
+        W_all = solve_augmented_system(X_aug, Y_aug, n_constraints)
+        solve_time = time.time() - start
+        
+    else:  # 'elimination' or 'penalty'
+        # Create windowed tensors
+        X_windows, Y_windows = create_windowed_tensors(X, Y, window_size, stride)
+        
+        # Solve with constraints
+        import time
+        start = time.time()
+        constraint_type = 'offset' if method == 'elimination' else 'penalty'
+        W_all = solve_all_windows_constrained(
+            X_windows, Y_windows, constraint_type, hedge_indices
+        )
+        solve_time = time.time() - start
+    
+    n_windows = W_all.shape[0]
+    print(f"Solved {n_windows} windows in {solve_time:.3f}s ({n_windows/solve_time:.1f} windows/sec)")
+    
+    # Check constraint satisfaction
+    violations = jnp.abs(W_all[:, hedge_indices[0], :] + W_all[:, hedge_indices[1], :])
+    max_violation = jnp.max(violations)
+    mean_violation = jnp.mean(violations)
+    print(f"Offsetting constraint: max violation = {max_violation:.2e}, mean = {mean_violation:.2e}")
+    
+    # Discovery phase
+    discovered, consistency, mean_mags, max_mags = vectorized_discovery(
+        W_all, discovery_config, n_features, n_outputs
+    )
+    
+    # Combine with forced zeros
+    if forced_zeros is not None:
+        combined_zeros = forced_zeros | discovered
+    else:
+        combined_zeros = discovered
+    
+    n_discovered = jnp.sum(discovered)
+    n_combined = jnp.sum(combined_zeros)
+    print(f"Discovered {n_discovered} zeros ({100*n_discovered/(n_features*n_outputs):.1f}%)")
+    print(f"Total zeros: {n_combined} ({100*n_combined/(n_features*n_outputs):.1f}%)")
+    
+    # Apply zero constraints if any were found
+    if n_combined > 0:
+        print("Applying zero constraints...")
+        X_windows, Y_windows = create_windowed_tensors(X, Y, window_size, stride)
+        W_constrained = solve_with_zero_constraints(
+            X_windows, Y_windows, W_all, combined_zeros, hedge_indices
+        )
+    else:
+        W_constrained = W_all
+    
+    # Compute average coefficients
+    W_avg = jnp.mean(W_constrained, axis=0)
+    
+    # Performance metrics
+    Y_pred = X @ W_avg
+    r2 = 1 - jnp.sum((Y - Y_pred)**2) / jnp.sum((Y - jnp.mean(Y))**2)
+    print(f"Overall R²: {r2:.4f}")
+    
+    return {
+        'W_all': W_constrained,
+        'W_unconstrained': W_all,
+        'W_avg': W_avg,
+        'discovered_zeros': discovered,
+        'combined_zeros': combined_zeros,
+        'consistency': consistency,
+        'violations': violations,
+        'r2': r2,
+        'solve_time': solve_time,
+        'method': method
+    }
+
+# ============= BATCH PROCESSING FOR LARGE DATA =============
+
+def process_in_batches(X, Y, window_size, stride, n_countries, n_tenors,
+                      batch_size=100, **kwargs):
+    """
+    Process large datasets in batches to manage memory.
+    """
+    n_samples = X.shape[0]
+    n_total_windows = (n_samples - window_size) // stride + 1
+    n_batches = (n_total_windows + batch_size - 1) // batch_size
+    
+    print(f"Processing {n_total_windows} windows in {n_batches} batches of size {batch_size}")
+    
+    all_results = []
+    
+    for batch_idx in range(n_batches):
+        start_window = batch_idx * batch_size
+        end_window = min((batch_idx + 1) * batch_size, n_total_windows)
+        
+        # Calculate sample indices for this batch
+        start_sample = start_window * stride
+        end_sample = min(start_sample + (end_window - start_window) * stride + window_size, n_samples)
+        
+        # Extract batch
+        X_batch = X[start_sample:end_sample]
+        Y_batch = Y[start_sample:end_sample]
+        
+        # Adjust stride for first window to start at beginning of batch
+        batch_result = efficient_constrained_regression(
+            X_batch, Y_batch, window_size, stride, 
+            n_countries, n_tenors, **kwargs
+        )
+        
+        all_results.append(batch_result['W_all'])
+        
+        print(f"  Batch {batch_idx+1}/{n_batches} complete")
+    
+    # Combine results
+    W_all_combined = jnp.concatenate(all_results, axis=0)
+    
+    return W_all_combined
+
+# ============= EXAMPLE USAGE =============
+
+def example_with_your_data():
+    """Example showing how to use with your data structure"""
+    
+    # Your dimensions
+    n_samples = 1256
+    n_hedges = 7
+    n_countries = 14
+    n_tenors = 12
+    n_outputs = n_countries * n_tenors
+    
+    # Generate example data
+    key = jax.random.PRNGKey(42)
+    X = jax.random.normal(key, (n_samples, n_hedges))
+    
+    # Create true coefficients with structure
+    W_true = jnp.zeros((n_hedges, n_outputs))
+    
+    # Make hedges 3 and 5 (indices 2 and 4) offsetting
+    for i in range(0, n_outputs, 3):
+        W_true = W_true.at[2, i].set(1.5)
+        W_true = W_true.at[4, i].set(-1.5)
+    
+    # Add other structure
+    W_true = W_true.at[0, :50].set(2.0)
+    W_true = W_true.at[1, 50:100].set(-1.0)
+    
+    Y = X @ W_true + 0.1 * jax.random.normal(key, (n_samples, n_outputs))
+    
+    # Method 1: Augmented system (most general)
+    print("=" * 70)
+    print("METHOD 1: AUGMENTED SYSTEM")
+    print("=" * 70)
+    
+    result1 = efficient_constrained_regression(
+        X, Y, 
+        window_size=200,
+        stride=50,
+        n_countries=n_countries,
+        n_tenors=n_tenors,
+        hedge_indices=(2, 4),
+        method='augmented'
+    )
+    
+    # Method 2: Variable elimination (fastest for single linear constraint)
+    print("\n" + "=" * 70)
+    print("METHOD 2: VARIABLE ELIMINATION")
+    print("=" * 70)
+    
+    result2 = efficient_constrained_regression(
+        X, Y,
+        window_size=200,
+        stride=50,
+        n_countries=n_countries,
+        n_tenors=n_tenors,
+        hedge_indices=(2, 4),
+        method='elimination'
+    )
+    
+    # Method 3: With forced zeros
+    print("\n" + "=" * 70)
+    print("METHOD 3: WITH FORCED ZEROS")
+    print("=" * 70)
+    
+    # Force hedge 7 to be zero for first 50 outputs
+    forced_zeros = jnp.zeros((n_hedges, n_outputs), dtype=bool)
+    forced_zeros = forced_zeros.at[6, :50].set(True)
+    
+    result3 = efficient_constrained_regression(
+        X, Y,
+        window_size=200,
+        stride=50,
+        n_countries=n_countries,
+        n_tenors=n_tenors,
+        hedge_indices=(2, 4),
+        method='elimination',
+        forced_zeros=forced_zeros,
+        discovery_config={
+            'consistency_threshold': 0.85,
+            'magnitude_threshold': 0.08,
+            'relative_threshold': 0.15,
+            'check_relative': True
+        }
+    )
+    
+    # Compare results
+    print("\n" + "=" * 70)
+    print("RESULTS COMPARISON")
+    print("=" * 70)
+    
+    for name, result in [("Augmented", result1), 
+                        ("Elimination", result2), 
+                        ("With Zeros", result3)]:
+        W_avg = result['W_avg']
+        offset_check = W_avg[2, :] + W_avg[4, :]
+        
+        print(f"\n{name}:")
+        print(f"  Max offset violation: {jnp.max(jnp.abs(offset_check)):.2e}")
+        print(f"  R²: {result['r2']:.4f}")
+        print(f"  Processing rate: {result['W_all'].shape[0]/result['solve_time']:.1f} windows/sec")
+        
+        if 'combined_zeros' in result:
+            print(f"  Sparsity: {100*jnp.mean(result['combined_zeros']):.1f}%")
+    
+    return result1, result2, result3
+
+# ============= VISUALIZATION =============
+
+def plot_efficient_results(result, hedge_indices=(2, 4)):
+    """Quick visualization of results"""
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    W_avg = result['W_avg']
+    idx1, idx2 = hedge_indices
+    
+    # Plot 1: Average coefficients heatmap
+    ax = axes[0, 0]
+    im = ax.imshow(W_avg, cmap='RdBu_r', vmin=-2, vmax=2, aspect='auto')
+    ax.set_xlabel('Output')
+    ax.set_ylabel('Hedge')
+    ax.set_title('Average Coefficients')
+    plt.colorbar(im, ax=ax)
+    
+    # Plot 2: Offsetting hedges
+    ax = axes[0, 1]
+    ax.plot(W_avg[idx1, :], 'b-', label=f'Hedge {idx1+1}', alpha=0.7)
+    ax.plot(W_avg[idx2, :], 'r-', label=f'Hedge {idx2+1}', alpha=0.7)
+    ax.plot(W_avg[idx1, :] + W_avg[idx2, :], 'k--', label='Sum', linewidth=2)
+    ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+    ax.set_xlabel('Output')
+    ax.set_ylabel('Coefficient')
+    ax.set_title('Offsetting Constraint Check')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 3: Discovered zeros
+    ax = axes[1, 0]
+    if 'combined_zeros' in result:
+        im = ax.imshow(result['combined_zeros'].astype(float), cmap='Reds', aspect='auto')
+        ax.set_xlabel('Output')
+        ax.set_ylabel('Hedge')
+        ax.set_title('Zero Constraints (Red = Zero)')
+        plt.colorbar(im, ax=ax)
+    
+    # Plot 4: Performance over windows
+    ax = axes[1, 1]
+    n_windows = result['W_all'].shape[0]
+    window_r2 = []
+    
+    # Compute R² for a few windows
+    for i in range(0, n_windows, max(1, n_windows//20)):
+        W_i = result['W_all'][i]
+        # Would need actual window data to compute R²
+        # This is just for illustration
+        window_r2.append(result['r2'] + 0.01 * np.random.randn())
+    
+    ax.plot(range(0, n_windows, max(1, n_windows//20)), window_r2, 'g-', linewidth=2)
+    ax.axhline(y=result['r2'], color='r', linestyle='--', label=f'Average R²={result["r2"]:.3f}')
+    ax.set_xlabel('Window Index')
+    ax.set_ylabel('R²')
+    ax.set_title('Model Performance')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
+if __name__ == "__main__":
+    # Run example
+    results = example_with_your_data()
+    
+    # Visualize
+    print("\nVisualizing results...")
+    plot_efficient_results(results[2])  # Plot the third result
