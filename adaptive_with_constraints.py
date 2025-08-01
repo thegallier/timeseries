@@ -3004,3 +3004,534 @@ if __name__ == "__main__":
         'KKT': results[1],
         'Combined': results[2]
     })
+
+## l1 optimization with descent
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import cvxpy as cp
+import time
+
+# ============= AUGMENTED SYSTEM WITH L1 CONSTRAINTS =============
+
+def create_block_diagonal_system(X, Y, window_size, stride):
+    """
+    Create block diagonal system for all windows at once.
+    
+    Returns:
+        X_block: Block diagonal matrix where each block is a window
+        Y_vec: Stacked Y values for all windows
+        window_indices: Indices to extract solutions for each window
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    # Create block diagonal X matrix
+    # Each block is (window_size × n_features)
+    # Total size: (n_windows * window_size) × (n_windows * n_features)
+    
+    blocks = []
+    Y_blocks = []
+    
+    for i in range(n_windows):
+        start = i * stride
+        end = start + window_size
+        blocks.append(X[start:end])
+        Y_blocks.append(Y[start:end])
+    
+    # Use JAX's block diagonal construction
+    X_block = jax.scipy.linalg.block_diag(*blocks)
+    Y_vec = jnp.vstack(Y_blocks)
+    
+    # Window indices for extracting solutions
+    window_indices = [(i * n_features, (i + 1) * n_features) for i in range(n_windows)]
+    
+    return X_block, Y_vec, window_indices, n_windows
+
+def solve_all_windows_l1_constrained(X, Y, window_size, stride, 
+                                   hedge_indices=(2, 4), l1_bound=None):
+    """
+    Solve all windows at once with L1 and offsetting constraints.
+    
+    This creates one large optimization problem that solves all windows simultaneously.
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    print(f"Vectorized L1-constrained regression: {n_windows} windows in one pass")
+    
+    # Create block diagonal system
+    X_block, Y_vec, window_indices, n_windows = create_block_diagonal_system(
+        X, Y, window_size, stride
+    )
+    
+    # Total number of variables: n_windows * n_features
+    n_total_vars = n_windows * n_features
+    
+    # Build constraint matrices for offsetting constraint
+    # For each window, enforce w[idx1] + w[idx2] = 0
+    idx1, idx2 = hedge_indices
+    
+    # Constraint matrix A: (n_windows × n_total_vars)
+    # Each row enforces the constraint for one window
+    A_offset = jnp.zeros((n_windows, n_total_vars))
+    
+    for i in range(n_windows):
+        window_start = i * n_features
+        A_offset = A_offset.at[i, window_start + idx1].set(1)
+        A_offset = A_offset.at[i, window_start + idx2].set(1)
+    
+    # Right-hand side (all zeros)
+    b_offset = jnp.zeros(n_windows)
+    
+    # Solve using augmented system
+    if l1_bound is not None:
+        # With L1 constraint - need iterative solver
+        W_all = solve_augmented_l1_system(
+            X_block, Y_vec, A_offset, b_offset, 
+            n_windows, n_features, n_outputs, l1_bound
+        )
+    else:
+        # Without L1 constraint - can solve directly
+        W_all = solve_augmented_system_direct(
+            X_block, Y_vec, A_offset, b_offset,
+            n_windows, n_features, n_outputs
+        )
+    
+    return W_all
+
+def solve_augmented_system_direct(X_block, Y_vec, A_offset, b_offset,
+                                n_windows, n_features, n_outputs):
+    """
+    Solve augmented system directly (no L1 constraint).
+    
+    [X_block^T X_block   A_offset^T] [W]   [X_block^T Y_vec]
+    [A_offset            0         ] [λ] = [b_offset       ]
+    """
+    print("Solving augmented system directly...")
+    
+    # For each output, solve the augmented system
+    W_all_outputs = []
+    
+    for j in range(n_outputs):
+        # Build augmented matrix
+        XtX = X_block.T @ X_block
+        XtY = X_block.T @ Y_vec[:, j]
+        
+        # Augmented system
+        n_vars = XtX.shape[0]
+        n_constraints = A_offset.shape[0]
+        
+        aug_matrix = jnp.zeros((n_vars + n_constraints, n_vars + n_constraints))
+        aug_matrix = aug_matrix.at[:n_vars, :n_vars].set(XtX + 1e-6 * jnp.eye(n_vars))
+        aug_matrix = aug_matrix.at[:n_vars, n_vars:].set(A_offset.T)
+        aug_matrix = aug_matrix.at[n_vars:, :n_vars].set(A_offset)
+        
+        aug_rhs = jnp.zeros(n_vars + n_constraints)
+        aug_rhs = aug_rhs.at[:n_vars].set(XtY)
+        aug_rhs = aug_rhs.at[n_vars:].set(b_offset)
+        
+        # Solve
+        sol = jnp.linalg.solve(aug_matrix, aug_rhs)
+        w_vec = sol[:n_vars]
+        
+        W_all_outputs.append(w_vec)
+    
+    # Stack and reshape
+    W_matrix = jnp.stack(W_all_outputs, axis=1)  # (n_total_vars, n_outputs)
+    
+    # Reshape to (n_windows, n_features, n_outputs)
+    W_all = W_matrix.reshape(n_windows, n_features, n_outputs)
+    
+    return W_all
+
+def solve_augmented_l1_system(X_block, Y_vec, A_offset, b_offset,
+                            n_windows, n_features, n_outputs, l1_bound):
+    """
+    Solve augmented system with L1 constraint using CVXPY.
+    
+    min ||Y - X_block @ W||^2
+    s.t. A_offset @ W = b_offset  (offsetting constraints)
+         ||W||_1 <= l1_bound      (L1 constraint)
+    """
+    print(f"Solving with L1 bound = {l1_bound} using CVXPY...")
+    
+    # Use CVXPY for constrained optimization
+    n_total_vars = n_windows * n_features
+    
+    W_all_outputs = []
+    
+    for j in range(n_outputs):
+        # Define variables
+        w = cp.Variable(n_total_vars)
+        
+        # Objective: minimize squared error
+        objective = cp.Minimize(cp.sum_squares(X_block @ w - Y_vec[:, j]))
+        
+        # Constraints
+        constraints = [
+            A_offset @ w == b_offset,  # Offsetting constraints
+            cp.norm(w, 1) <= l1_bound  # L1 constraint
+        ]
+        
+        # Solve
+        prob = cp.Problem(objective, constraints)
+        prob.solve(solver=cp.OSQP, verbose=False)
+        
+        if prob.status != cp.OPTIMAL:
+            print(f"Warning: Output {j} solution status: {prob.status}")
+        
+        W_all_outputs.append(w.value)
+    
+    # Stack and reshape
+    W_matrix = np.stack(W_all_outputs, axis=1)
+    W_all = W_matrix.reshape(n_windows, n_features, n_outputs)
+    
+    return jnp.array(W_all)
+
+# ============= VECTORIZED LASSO WITH CONSTRAINTS =============
+
+def vectorized_lasso_all_windows(X, Y, window_size, stride, 
+                               hedge_indices=(2, 4), lasso_lambda=0.1):
+    """
+    Solve LASSO for all windows at once using block structure.
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    print(f"Vectorized LASSO: {n_windows} windows, lambda = {lasso_lambda}")
+    
+    # Create block diagonal system
+    X_block, Y_vec, _, _ = create_block_diagonal_system(X, Y, window_size, stride)
+    
+    # Build offsetting constraints
+    idx1, idx2 = hedge_indices
+    n_total_vars = n_windows * n_features
+    
+    A_offset = np.zeros((n_windows, n_total_vars))
+    for i in range(n_windows):
+        window_start = i * n_features
+        A_offset[i, window_start + idx1] = 1
+        A_offset[i, window_start + idx2] = 1
+    
+    b_offset = np.zeros(n_windows)
+    
+    # Solve using CVXPY
+    W_all_outputs = []
+    
+    for j in range(n_outputs):
+        # Define variables
+        w = cp.Variable(n_total_vars)
+        
+        # Objective: squared error + LASSO penalty
+        objective = cp.Minimize(
+            cp.sum_squares(X_block @ w - Y_vec[:, j]) + 
+            lasso_lambda * cp.norm(w, 1)
+        )
+        
+        # Constraints: only offsetting
+        constraints = [A_offset @ w == b_offset]
+        
+        # Solve
+        prob = cp.Problem(objective, constraints)
+        prob.solve(solver=cp.OSQP, verbose=False)
+        
+        W_all_outputs.append(w.value)
+    
+    # Reshape
+    W_matrix = np.stack(W_all_outputs, axis=1)
+    W_all = W_matrix.reshape(n_windows, n_features, n_outputs)
+    
+    return jnp.array(W_all)
+
+# ============= FAST JAX-ONLY VERSION =============
+
+@jax.jit
+def build_global_system_matrices(X_windows, Y_windows, n_windows, n_features, n_outputs):
+    """
+    Build global system matrices for all windows efficiently.
+    """
+    # Stack all X matrices
+    X_global = jnp.zeros((n_windows * X_windows.shape[1], n_windows * n_features))
+    Y_global = Y_windows.reshape(-1, n_outputs)
+    
+    # Fill block diagonal
+    for i in range(n_windows):
+        row_start = i * X_windows.shape[1]
+        row_end = (i + 1) * X_windows.shape[1]
+        col_start = i * n_features
+        col_end = (i + 1) * n_features
+        
+        X_global = X_global.at[row_start:row_end, col_start:col_end].set(X_windows[i])
+    
+    return X_global, Y_global
+
+def efficient_vectorized_regression(X, Y, window_size, stride, n_countries, n_tenors,
+                                  hedge_indices=(2, 4), method='direct'):
+    """
+    Efficient vectorized regression solving all windows at once.
+    """
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    print(f"Efficient vectorized regression: {n_windows} windows")
+    print(f"Method: {method}")
+    
+    # Create windows
+    X_windows = jnp.array([X[i*stride:i*stride+window_size] 
+                          for i in range(n_windows)])
+    Y_windows = jnp.array([Y[i*stride:i*stride+window_size] 
+                          for i in range(n_windows)])
+    
+    start_time = time.time()
+    
+    if method == 'direct':
+        # Direct solution with offsetting constraints
+        W_all = solve_all_windows_l1_constrained(
+            X, Y, window_size, stride, hedge_indices, l1_bound=None
+        )
+        
+    elif method == 'l1_constrained':
+        # With L1 constraint
+        total_features = n_windows * n_features
+        l1_bound = 10.0 * n_windows  # Scale with number of windows
+        
+        W_all = solve_all_windows_l1_constrained(
+            X, Y, window_size, stride, hedge_indices, l1_bound=l1_bound
+        )
+        
+    elif method == 'lasso':
+        # LASSO with offsetting
+        W_all = vectorized_lasso_all_windows(
+            X, Y, window_size, stride, hedge_indices, lasso_lambda=0.1
+        )
+    
+    solve_time = time.time() - start_time
+    
+    # Compute metrics
+    W_avg = jnp.mean(W_all, axis=0)
+    Y_pred = X @ W_avg
+    r2 = 1 - jnp.sum((Y - Y_pred)**2) / jnp.sum((Y - jnp.mean(Y))**2)
+    
+    # Check constraints
+    offset_viols = jnp.abs(W_all[:, hedge_indices[0], :] + W_all[:, hedge_indices[1], :])
+    l1_norms = jnp.sum(jnp.abs(W_all), axis=(1, 2))
+    
+    print(f"\nSolved in {solve_time:.3f}s (all windows at once!)")
+    print(f"Max offset violation: {jnp.max(offset_viols):.2e}")
+    print(f"Average L1 norm per window: {jnp.mean(l1_norms):.2f}")
+    print(f"R²: {r2:.4f}")
+    
+    return {
+        'W_all': W_all,
+        'W_avg': W_avg,
+        'r2': r2,
+        'solve_time': solve_time,
+        'offset_violations': offset_viols,
+        'l1_norms': l1_norms,
+        'method': method
+    }
+
+# ============= SPARSE MATRIX VERSION =============
+
+def sparse_block_diagonal_solve(X, Y, window_size, stride, hedge_indices=(2, 4)):
+    """
+    Use sparse matrices for very large problems.
+    """
+    from scipy.sparse import block_diag, csr_matrix
+    from scipy.sparse.linalg import lsqr
+    
+    n_samples, n_features = X.shape
+    n_outputs = Y.shape[1]
+    n_windows = (n_samples - window_size) // stride + 1
+    
+    print(f"Sparse matrix solve: {n_windows} windows")
+    
+    # Create sparse blocks
+    blocks = []
+    Y_blocks = []
+    
+    for i in range(n_windows):
+        start = i * stride
+        end = start + window_size
+        blocks.append(csr_matrix(X[start:end]))
+        Y_blocks.append(Y[start:end])
+    
+    # Build sparse block diagonal matrix
+    X_sparse = block_diag(blocks)
+    Y_stacked = np.vstack(Y_blocks)
+    
+    # Build constraint matrix (sparse)
+    idx1, idx2 = hedge_indices
+    n_total_vars = n_windows * n_features
+    
+    # Constraint rows
+    row_indices = []
+    col_indices = []
+    data = []
+    
+    for i in range(n_windows):
+        window_start = i * n_features
+        # Constraint: w[idx1] + w[idx2] = 0
+        row_indices.extend([i, i])
+        col_indices.extend([window_start + idx1, window_start + idx2])
+        data.extend([1, 1])
+    
+    A_constraint = csr_matrix((data, (row_indices, col_indices)), 
+                             shape=(n_windows, n_total_vars))
+    
+    # Solve for each output
+    W_all = []
+    
+    for j in range(n_outputs):
+        # Use LSQR with constraints (approximate)
+        # First solve unconstrained
+        w_unconstrained, _ = lsqr(X_sparse, Y_stacked[:, j])[:2]
+        
+        # Project onto constraint space
+        # (This is approximate - for exact solution use optimization solver)
+        w_constrained = w_unconstrained.copy()
+        
+        # Enforce constraints by averaging
+        for i in range(n_windows):
+            w_start = i * n_features
+            val1 = w_constrained[w_start + idx1]
+            val2 = w_constrained[w_start + idx2]
+            avg = (val1 - val2) / 2
+            w_constrained[w_start + idx1] = avg
+            w_constrained[w_start + idx2] = -avg
+        
+        W_all.append(w_constrained)
+    
+    # Reshape
+    W_matrix = np.stack(W_all, axis=1)
+    W_final = W_matrix.reshape(n_windows, n_features, n_outputs)
+    
+    return jnp.array(W_final)
+
+# ============= COMPARISON =============
+
+def compare_vectorized_methods(X, Y, window_size, stride, n_countries, n_tenors):
+    """
+    Compare different vectorized approaches.
+    """
+    results = {}
+    
+    print("="*70)
+    print("VECTORIZED METHODS COMPARISON")
+    print("="*70)
+    
+    # Method 1: Direct augmented system
+    print("\nMethod 1: Direct Augmented System")
+    results['direct'] = efficient_vectorized_regression(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        method='direct'
+    )
+    
+    # Method 2: With L1 constraint
+    print("\nMethod 2: L1 Constrained")
+    results['l1'] = efficient_vectorized_regression(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        method='l1_constrained'
+    )
+    
+    # Method 3: LASSO
+    print("\nMethod 3: LASSO")
+    results['lasso'] = efficient_vectorized_regression(
+        X, Y, window_size, stride, n_countries, n_tenors,
+        method='lasso'
+    )
+    
+    # Method 4: Sparse (for large problems)
+    print("\nMethod 4: Sparse Matrix")
+    start = time.time()
+    W_sparse = sparse_block_diagonal_solve(X, Y, window_size, stride)
+    sparse_time = time.time() - start
+    
+    W_avg = jnp.mean(W_sparse, axis=0)
+    Y_pred = X @ W_avg
+    r2 = 1 - jnp.sum((Y - Y_pred)**2) / jnp.sum((Y - jnp.mean(Y))**2)
+    
+    results['sparse'] = {
+        'W_all': W_sparse,
+        'W_avg': W_avg,
+        'r2': r2,
+        'solve_time': sparse_time,
+        'method': 'sparse'
+    }
+    
+    print(f"Sparse solve time: {sparse_time:.3f}s")
+    print(f"Sparse R²: {r2:.4f}")
+    
+    # Summary
+    print("\n" + "="*70)
+    print("SUMMARY: All Windows Solved in One Pass!")
+    print("="*70)
+    print(f"{'Method':<15} {'Time (s)':<10} {'R²':<10} {'Sparsity %':<12}")
+    print("-"*47)
+    
+    for name, result in results.items():
+        sparsity = 100 * jnp.mean(jnp.abs(result['W_avg']) < 1e-6)
+        print(f"{name:<15} {result['solve_time']:<10.3f} {result['r2']:<10.4f} {sparsity:<12.1f}")
+    
+    return results
+
+# ============= EXAMPLE USAGE =============
+
+def example_vectorized():
+    """
+    Example of vectorized approach.
+    """
+    # Generate data
+    n_samples = 1256
+    n_hedges = 7
+    n_countries = 14
+    n_tenors = 12
+    n_outputs = n_countries * n_tenors
+    
+    key = jax.random.PRNGKey(42)
+    X = jax.random.normal(key, (n_samples, n_hedges))
+    
+    # True coefficients
+    W_true = jnp.zeros((n_hedges, n_outputs))
+    
+    # Offsetting hedges
+    for i in range(0, n_outputs, 3):
+        W_true = W_true.at[2, i].set(1.5)
+        W_true = W_true.at[4, i].set(-1.5)
+    
+    # Other sparse coefficients
+    W_true = W_true.at[0, :30].set(2.0)
+    W_true = W_true.at[1, 50:70].set(-1.0)
+    
+    Y = X @ W_true + 0.1 * jax.random.normal(key, (n_samples, n_outputs))
+    
+    # Compare methods
+    results = compare_vectorized_methods(X, Y, 200, 50, n_countries, n_tenors)
+    
+    return results
+
+if __name__ == "__main__":
+    # Note: Requires cvxpy installation: pip install cvxpy
+    try:
+        import cvxpy
+        results = example_vectorized()
+    except ImportError:
+        print("Note: This implementation requires CVXPY for constrained optimization.")
+        print("Install with: pip install cvxpy")
+        print("\nShowing sparse matrix approach instead...")
+        
+        # Demo sparse approach
+        n_samples = 1256
+        key = jax.random.PRNGKey(42)
+        X = jax.random.normal(key, (n_samples, 7))
+        Y = jax.random.normal(key, (n_samples, 168))
+        
+        W = sparse_block_diagonal_solve(X, Y, 200, 50)
+        print(f"Result shape: {W.shape}")
+      
