@@ -1,3 +1,62 @@
+import jax
+import jax.numpy as jnp
+from jax.scipy.stats import t as student_t
+
+def batched_rolling_trend_jax(coef_tensor: jnp.ndarray, window: int = 50, alpha: float = 0.05):
+    """
+    Detects local linear trends in a tensor of coefficient series using JAX.
+    
+    Args:
+        coef_tensor: jnp.ndarray of shape (n_series, n_time)
+        window: sliding window length
+        alpha: significance level for trend detection
+    
+    Returns:
+        dict with keys: 'slope', 't_stat', 'p_val', 'is_trending'
+        Each value is a jnp.ndarray of shape (n_series, n_windows)
+    """
+    n_series, n_time = coef_tensor.shape
+    n_windows = n_time - window + 1
+
+    # Prepare fixed design matrix: X = [1, t]
+    t_vec = jnp.arange(window)
+    X = jnp.stack([jnp.ones(window), t_vec], axis=1)             # shape: (window, 2)
+    XtX_inv = jnp.linalg.inv(X.T @ X)                            # shape: (2, 2)
+    Xt = X.T                                                     # shape: (2, window)
+    
+    # Get strided rolling windows (n_series, n_windows, window)
+    def sliding_windows(x, window):
+        i = jnp.arange(window)[None, None, :]
+        j = jnp.arange(n_windows)[None, :, None]
+        return x[:, j + i]                                       # shape: (n_series, n_windows, window)
+
+    Y = sliding_windows(coef_tensor, window)                     # shape: (n_series, n_windows, window)
+
+    # Compute beta = (X'X)^(-1) X'Y for all windows and series
+    beta = jnp.einsum('ij,jk,nwk->nwi', XtX_inv, Xt, Y)          # shape: (n_series, n_windows, 2)
+    slopes = beta[:, :, 1]                                       # (n_series, n_windows)
+
+    # Predicted values and residuals
+    Y_hat = jnp.einsum('ij,nwj->nwi', X, beta)                   # (n_series, n_windows, window)
+    residuals = Y - Y_hat                                        # (n_series, n_windows, window)
+    
+    dof = window - 2
+    sigma_sq = jnp.sum(residuals ** 2, axis=-1) / dof            # (n_series, n_windows)
+    se_slope = jnp.sqrt(sigma_sq * XtX_inv[1, 1])                # scalar multiplier
+
+    t_stat = slopes / se_slope                                   # (n_series, n_windows)
+    p_val = 2 * student_t.sf(jnp.abs(t_stat), df=dof)            # (n_series, n_windows)
+    is_trending = p_val < alpha                                  # (n_series, n_windows)
+
+    return {
+        'slope': slopes,
+        't_stat': t_stat,
+        'p_val': p_val,
+        'is_trending': is_trending
+    }
+
+/// old
+
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
