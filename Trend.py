@@ -1,3 +1,30 @@
+import numpy as np
+import pandas as pd
+
+np.random.seed(42)
+n = 300
+
+# Simulate 3 artificial coefficients
+# Series 1: stationary white noise
+coef1 = np.random.normal(0, 1, n)
+
+# Series 2: linear upward trend
+coef2 = 0.01 * np.arange(n) + np.random.normal(0, 0.5, n)
+
+# Series 3: random walk (unit root)
+coef3 = np.cumsum(np.random.normal(0, 0.3, n))
+
+# Combine into DataFrame
+beta_df = pd.DataFrame({
+    'coef_stationary': coef1,
+    'coef_trending': coef2,
+    'coef_unitroot': coef3
+})
+
+results = analyze_coef_trend_adf_kpss_kalman(beta_df, window=50, alpha=0.05, plot=True)
+
+# above data example
+
 import jax.numpy as jnp
 from jax.scipy.stats import t as student_t
 from statsmodels.tsa.stattools import adfuller, kpss
