@@ -653,3 +653,492 @@ for method in methods:
     r2 = compute_r2(X, Y, W_final)
     
     print(f"{method}: R²={r2:.4f}, Sparsity={sparsity:.1%}")
+/====
+
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+from typing import Dict, Optional, Tuple
+import matplotlib.pyplot as plt
+
+
+def add_post_processing_to_results(
+    results: Dict,
+    X: jnp.ndarray,
+    Y: jnp.ndarray,
+    post_processing_config: Dict = None,
+    verbose: bool = True
+) -> Dict:
+    """
+    Add post-processing and true R² to existing results from batch computation.
+    
+    Args:
+        results: Results from compute_all_countries_hedge_ratios_batch
+        X: Original input data
+        Y: Original output data  
+        post_processing_config: Post-processing configuration
+        verbose: Print details
+        
+    Returns:
+        Updated results with post-processed coefficients and true R²
+    """
+    
+    if 'batch_results' not in results:
+        print("No batch_results found")
+        return results
+    
+    batch_results = results['batch_results']
+    
+    # Get configuration
+    config = batch_results.get('config', {})
+    window_size = config.get('window_size', 200)
+    stride = config.get('stride', 150)
+    
+    # Get raw coefficients
+    if 'W_all' in batch_results:
+        W_raw_all = batch_results['W_all']  # (n_windows, n_features, n_outputs)
+        W_raw_avg = batch_results.get('W_avg', jnp.mean(W_raw_all, axis=0))
+    elif 'W_avg' in batch_results:
+        W_raw_avg = batch_results['W_avg']  # (n_features, n_outputs)
+        W_raw_all = None
+    else:
+        print("No coefficients found")
+        return results
+    
+    # Default post-processing if not specified
+    if post_processing_config is None:
+        post_processing_config = {'zero_threshold': 1e-6}
+    
+    if verbose:
+        print("="*60)
+        print("POST-PROCESSING AND TRUE R² COMPUTATION")
+        print("="*60)
+        print(f"Post-processing config: {post_processing_config}")
+    
+    # Apply post-processing to averaged coefficients
+    W_processed_avg = apply_post_processing(
+        W_raw_avg,
+        post_processing_config=post_processing_config,
+        verbose=verbose
+    )
+    
+    # Store post-processed coefficients
+    results['W_processed'] = W_processed_avg
+    batch_results['W_processed'] = W_processed_avg
+    
+    # Apply post-processing to all windows if available
+    if W_raw_all is not None:
+        W_processed_all = apply_post_processing(
+            W_raw_all,
+            post_processing_config=post_processing_config,
+            verbose=False
+        )
+        results['W_processed_all'] = W_processed_all
+        batch_results['W_processed_all'] = W_processed_all
+    
+    # Compute true R² using post-processed coefficients
+    r2_results = compute_true_r_squared_with_post_processing(
+        X, Y, W_raw_avg,
+        window_size=window_size,
+        stride=stride,
+        post_processing_config=post_processing_config,
+        verbose=verbose
+    )
+    
+    # Add R² metrics to results
+    results['r2_true'] = r2_results
+    batch_results['r2_true'] = r2_results
+    
+    # Add post-processing config for reference
+    results['post_processing_config'] = post_processing_config
+    
+    # Update country results if present
+    if 'country_results' in results:
+        builder = HedgeConstraintBuilder()
+        
+        for country, country_data in results['country_results'].items():
+            country_idx = builder.countries.index(country)
+            n_tenors = len(builder.tenors)
+            
+            # Extract post-processed coefficients for this country
+            start_idx = country_idx * n_tenors
+            end_idx = (country_idx + 1) * n_tenors
+            W_country_processed = W_processed_avg[:, start_idx:end_idx]
+            
+            # Store in country results
+            country_data['W_processed'] = W_country_processed
+            country_data['n_nonzero_processed'] = int(jnp.sum(jnp.abs(W_country_processed) > 1e-10))
+            country_data['sparsity_processed'] = float(1 - country_data['n_nonzero_processed'] / W_country_processed.size)
+    
+    if verbose:
+        print(f"\nPost-processing complete:")
+        print(f"  Original non-zeros: {jnp.sum(jnp.abs(W_raw_avg) > 1e-10)}")
+        print(f"  Post-processed non-zeros: {r2_results['n_nonzero']}")
+        print(f"  Sparsity achieved: {r2_results['sparsity']:.1%}")
+    
+    return results
+
+
+def compare_post_processing_on_methods(
+    comparison_results: Dict,
+    X: jnp.ndarray,
+    Y: jnp.ndarray,
+    post_processing_configs: Dict[str, Dict],
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Apply different post-processing configs to method comparison results.
+    
+    Args:
+        comparison_results: Output from compare_regression_methods
+        X: Input data
+        Y: Output data
+        post_processing_configs: Dict of config_name -> config
+        verbose: Print details
+        
+    Returns:
+        DataFrame comparing R² and sparsity across methods and configs
+    """
+    
+    comparison_data = []
+    
+    for method_name, method_data in comparison_results.items():
+        if 'results' not in method_data:
+            continue
+        
+        # Get raw coefficients from the method
+        results = method_data['results']
+        if 'batch_results' in results and 'W_avg' in results['batch_results']:
+            W_raw = results['batch_results']['W_avg']
+        else:
+            continue
+        
+        # Get window configuration
+        config = results['batch_results'].get('config', {})
+        window_size = config.get('window_size', 200)
+        stride = config.get('stride', 150)
+        
+        # Apply each post-processing configuration
+        for config_name, post_config in post_processing_configs.items():
+            
+            # Compute R² with this post-processing
+            r2_results = compute_true_r_squared_with_post_processing(
+                X, Y, W_raw,
+                window_size=window_size,
+                stride=stride,
+                post_processing_config=post_config,
+                verbose=False
+            )
+            
+            comparison_data.append({
+                'Method': method_name,
+                'Post-Processing': config_name,
+                'R² Overall': r2_results['r2_overall'],
+                'R² Mean': r2_results['r2_mean'],
+                'RMSE': r2_results['rmse'],
+                'Non-zeros': r2_results['n_nonzero'],
+                'Sparsity': r2_results['sparsity'],
+                'Time (s)': method_data.get('computation_time', np.nan)
+            })
+    
+    df = pd.DataFrame(comparison_data)
+    
+    if verbose:
+        print("="*60)
+        print("POST-PROCESSING COMPARISON ACROSS METHODS")
+        print("="*60)
+        
+        # Create pivot table for better visualization
+        pivot_r2 = df.pivot_table(
+            values='R² Overall',
+            index='Method',
+            columns='Post-Processing'
+        )
+        
+        print("\nR² by Method and Post-Processing:")
+        print(pivot_r2.round(4))
+        
+        pivot_sparsity = df.pivot_table(
+            values='Sparsity',
+            index='Method',
+            columns='Post-Processing'
+        )
+        
+        print("\nSparsity by Method and Post-Processing:")
+        print(pivot_sparsity.round(3))
+        
+        # Find best configurations
+        best_r2 = df.loc[df['R² Overall'].idxmax()]
+        print(f"\nBest R²: {best_r2['Method']} with {best_r2['Post-Processing']}")
+        print(f"  R² = {best_r2['R² Overall']:.4f}, Sparsity = {best_r2['Sparsity']:.1%}")
+        
+        # Find sparsest with good R²
+        good_r2 = df[df['R² Overall'] > df['R² Overall'].max() * 0.95]
+        sparsest_good = good_r2.loc[good_r2['Sparsity'].idxmax()]
+        print(f"\nSparsest with R² > 95% of best:")
+        print(f"  {sparsest_good['Method']} with {sparsest_good['Post-Processing']}")
+        print(f"  R² = {sparsest_good['R² Overall']:.4f}, Sparsity = {sparsest_good['Sparsity']:.1%}")
+    
+    return df
+
+
+def example_correct_usage():
+    """
+    Example showing the correct way to access and use post-processed results.
+    """
+    
+    print("="*80)
+    print("CORRECT WAY TO USE POST-PROCESSING WITH RESULTS")
+    print("="*80)
+    
+    # Generate sample data
+    np.random.seed(42)
+    n_samples = 1256
+    X = jnp.array(np.random.randn(n_samples, 7))
+    Y = jnp.array(np.random.randn(n_samples, 168))
+    
+    # Country rules
+    country_rules = {
+        'BEL': {'allowed_countries': ['DEU', 'FRA'], 'use_adjacent_only': False},
+        'NLD': {'allowed_countries': ['DEU'], 'use_adjacent_only': True}
+    }
+    
+    print("\n1. SINGLE BATCH COMPUTATION (ONE VECTORIZED CALL)")
+    print("-"*60)
+    
+    # ONE vectorized call that computes everything
+    results = compute_all_countries_hedge_ratios_batch(
+        X=X, Y=Y,
+        country_rules=country_rules,
+        window_size=200,
+        stride=150,
+        method='jax',
+        constraint_method='penalty',
+        verbose=False
+    )
+    
+    print("Results structure after batch computation:")
+    print(f"  results['batch_results']['W_avg'] shape: {results['batch_results']['W_avg'].shape}")
+    print(f"  results['batch_results']['W_all'] shape: {results['batch_results']['W_all'].shape}")
+    
+    # Access raw coefficients (before post-processing)
+    W_raw = results['batch_results']['W_avg']
+    print(f"\nRaw coefficients:")
+    print(f"  Non-zeros: {jnp.sum(jnp.abs(W_raw) > 1e-10)}")
+    print(f"  Sparsity: {1 - jnp.sum(jnp.abs(W_raw) > 1e-10) / W_raw.size:.1%}")
+    
+    print("\n2. APPLYING POST-PROCESSING TO EXISTING RESULTS")
+    print("-"*60)
+    
+    # Define post-processing configurations
+    post_configs = {
+        'standard': {'zero_threshold': 1e-6},
+        'aggressive': {'zero_threshold': 1e-4, 'relative_threshold': 0.05},
+        'sparse': {'zero_threshold': 1e-6, 'keep_top_k': 3}
+    }
+    
+    # Apply each post-processing to the SAME results
+    for config_name, config in post_configs.items():
+        print(f"\n{config_name} post-processing:")
+        
+        # Add post-processing to existing results
+        results_updated = add_post_processing_to_results(
+            results.copy(),  # Work on a copy
+            X, Y,
+            post_processing_config=config,
+            verbose=False
+        )
+        
+        # Access post-processed coefficients
+        W_processed = results_updated['W_processed']
+        r2_true = results_updated['r2_true']['r2_overall']
+        sparsity = results_updated['r2_true']['sparsity']
+        
+        print(f"  True R²: {r2_true:.4f}")
+        print(f"  Sparsity: {sparsity:.1%}")
+        print(f"  Non-zeros: {jnp.sum(jnp.abs(W_processed) > 1e-10)}")
+    
+    print("\n3. COMPARING METHODS (STILL ONE CALL PER METHOD)")
+    print("-"*60)
+    
+    # Run comparison - each method is ONE vectorized call
+    comparison = compare_regression_methods(
+        X=X, Y=Y,
+        country_rules=country_rules,
+        window_size=200,
+        stride=150,
+        methods_to_test=['jax', 'vectorized'],
+        verbose=False
+    )
+    
+    print("Comparison structure:")
+    for method_name in comparison.keys():
+        W = comparison[method_name]['results']['batch_results']['W_avg']
+        print(f"  {method_name}: W shape = {W.shape}")
+    
+    # Apply post-processing to all methods
+    print("\n4. POST-PROCESSING ALL METHODS")
+    print("-"*60)
+    
+    df_comparison = compare_post_processing_on_methods(
+        comparison,
+        X, Y,
+        post_configs,
+        verbose=True
+    )
+    
+    print("\n5. ACCESSING SPECIFIC RESULTS")
+    print("-"*60)
+    
+    # Example: Get Belgium 10yr RX coefficient after standard post-processing
+    results_with_post = add_post_processing_to_results(
+        results.copy(),
+        X, Y,
+        post_processing_config={'zero_threshold': 1e-6},
+        verbose=False
+    )
+    
+    builder = HedgeConstraintBuilder()
+    bel_idx = builder.countries.index('BEL')
+    tenor_10yr_idx = builder.tenors.index('10yr')
+    rx_idx = builder.hedges.index('RX')
+    
+    # From post-processed coefficients
+    W_processed = results_with_post['W_processed']
+    bel_10yr_rx = W_processed[rx_idx, bel_idx * 14 + tenor_10yr_idx]
+    
+    print(f"Belgium 10yr RX coefficient (post-processed): {bel_10yr_rx:.6f}")
+    
+    # True R² for Belgium
+    bel_r2 = results_with_post['country_results']['BEL'].get('r2_metrics', {})
+    print(f"Belgium sparsity: {results_with_post['country_results']['BEL']['sparsity_processed']:.1%}")
+    
+    return results_with_post, df_comparison
+
+
+def visualize_post_processing_from_results(
+    results: Dict,
+    X: jnp.ndarray,
+    Y: jnp.ndarray
+) -> plt.Figure:
+    """
+    Visualize post-processing effects directly from results.
+    """
+    
+    # Apply different post-processing configs to same results
+    configs = {
+        'none': {'zero_threshold': 0},
+        'minimal': {'zero_threshold': 1e-10},
+        'standard': {'zero_threshold': 1e-6},
+        'aggressive': {'zero_threshold': 1e-4},
+        'sparse': {'zero_threshold': 1e-6, 'keep_top_k': 3}
+    }
+    
+    metrics = []
+    
+    for name, config in configs.items():
+        results_copy = results.copy()
+        results_updated = add_post_processing_to_results(
+            results_copy, X, Y, config, verbose=False
+        )
+        
+        metrics.append({
+            'Config': name,
+            'R²': results_updated['r2_true']['r2_overall'],
+            'Sparsity': results_updated['r2_true']['sparsity'],
+            'Non-zeros': results_updated['r2_true']['n_nonzero']
+        })
+    
+    df = pd.DataFrame(metrics)
+    
+    # Create visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # R² vs Sparsity
+    ax1.scatter(df['Sparsity'], df['R²'], s=100, alpha=0.7)
+    for _, row in df.iterrows():
+        ax1.annotate(row['Config'], 
+                    (row['Sparsity'], row['R²']),
+                    xytext=(5, 5), textcoords='offset points')
+    ax1.set_xlabel('Sparsity')
+    ax1.set_ylabel('True R² (no penalties)')
+    ax1.set_title('Post-Processing Trade-off')
+    ax1.grid(True, alpha=0.3)
+    
+    # Bar chart of non-zeros
+    ax2.bar(df['Config'], df['Non-zeros'], alpha=0.7)
+    ax2.set_ylabel('Non-zero Coefficients')
+    ax2.set_title('Sparsity by Configuration')
+    ax2.tick_params(axis='x', rotation=45)
+    
+    plt.suptitle('Post-Processing Effects on Single Batch Results')
+    plt.tight_layout()
+    
+    return fig
+
+
+if __name__ == "__main__":
+    results_with_post, df_comparison = example_correct_usage()
+    
+    print("\n" + "="*80)
+    print("KEY POINTS")
+    print("="*80)
+    print("\n1. Everything is computed in ONE vectorized call per method")
+    print("2. Results contain both raw and can contain post-processed coefficients")
+    print("3. R² is computed on post-processed coefficients (no penalties)")
+    print("4. You can apply different post-processing to the SAME results")
+    print("5. Access pattern:")
+    print("   - Raw: results['batch_results']['W_avg']")
+    print("   - Post-processed: results['W_processed']")
+    print("   - True R²: results['r2_true']['r2_overall']")
+
+
+# This ONE call computes everything for all countries/tenors/windows
+results = compute_all_countries_hedge_ratios_batch(
+    X=X, Y=Y,
+    country_rules=country_rules,
+    window_size=200,
+    stride=150,
+    method='jax'
+)
+
+# Raw coefficients (before post-processing)
+W_raw = results['batch_results']['W_avg']  # Shape: (7, 168)
+W_all_windows = results['batch_results']['W_all']  # Shape: (n_windows, 7, 168)
+
+# Add post-processing to existing results
+results = add_post_processing_to_results(
+    results,
+    X, Y,
+    post_processing_config={'zero_threshold': 1e-6}
+)
+
+# Now access post-processed coefficients
+W_processed = results['W_processed']  # Post-processed version
+r2_true = results['r2_true']['r2_overall']  # R² on clean coefficients
+
+
+# Compare methods - each method is ONE vectorized call
+comparison = compare_regression_methods(
+    X, Y, country_rules,
+    window_size=200,
+    stride=150,
+    methods_to_test=['jax', 'vectorized', 'cvxpy']
+)
+
+# Each method's results are stored
+jax_results = comparison['jax_penalty']['results']
+vec_results = comparison['vectorized']['results']
+cvx_results = comparison['cvxpy']['results']
+
+# Apply post-processing to each
+for method_name, method_data in comparison.items():
+    W_raw = method_data['results']['batch_results']['W_avg']
+    # Apply same post-processing to compare fairly
+    r2_results = compute_true_r_squared_with_post_processing(
+        X, Y, W_raw,
+        window_size=200,
+        stride=150,
+        post_processing_config={'zero_threshold': 1e-6}
+    )
+    print(f"{method_name}: R²={r2_results['r2_overall']:.4f}")
