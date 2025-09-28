@@ -917,7 +917,21 @@ if __name__ == "__main__":
     print(f"Monotonic values: {mono_sample.values.flatten()[:5]}...")
     print(f"Range: {np.ptp(mono_sample.values):.6f}")
     
-    print(f"Original shape: {df.shape}")
+    print("\n" + "="*50)
+    print("Full Pipeline Test with Time Smoothing")
+    print("="*50)
+    
+    # Now test the full pipeline with both tenor and time smoothing
+    full_config = SmoothingConfig(
+        tenor_method='pspline',
+        time_method='ewma',
+        tenor_params={'smoothing_param': 0.01, 'degree': 3},  # Light tenor smoothing
+        time_params={'decay': 0.94}  # Time smoothing
+    )
+    
+    smoothed = framework.smooth(df, full_config)
+    
+    print(f"\nOriginal shape: {df.shape}")
     print(f"Smoothed shape: {smoothed.shape}")
     print(f"NaN count original: {df.isna().sum().sum()}")
     print(f"NaN count smoothed: {smoothed.isna().sum().sum()}")
