@@ -1,4 +1,5 @@
-import pandas as pd
+# Use cleaned data for smoothing
+    df = df_cleanimport pandas as pd
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -476,32 +477,25 @@ class YieldSmoothingFramework:
             for date in dates:
                 for country in countries:
                     try:
-                        slice_idx = (date, country)
-                        if slice_idx in df.index:
-                            data = df.loc[slice_idx]
+                        # Get data for this date-country combination
+                        mask = (df.index.get_level_values(0) == date) & \
+                               (df.index.get_level_values(1) == country)
+                        
+                        if mask.any():
+                            data_slice = df.loc[mask]
                             
-                            # Handle both Series and DataFrame
-                            if isinstance(data, pd.Series):
-                                if len(data) > 1:
-                                    tenors = np.array(data.index).astype(float)
-                                    values = data.values
-                                    
-                                    # Check if we have enough valid data
-                                    if not np.all(np.isnan(values)):
-                                        smoothed = self.tenor_smoother.smooth(
-                                            tenors, values, 
-                                            config.tenor_method, 
-                                            **config.tenor_params
-                                        )
-                                        
-                                        # Only update if smoothing succeeded
-                                        if not np.all(np.isnan(smoothed)):
-                                            df.loc[slice_idx] = smoothed
-                                        
-                            elif isinstance(data, pd.DataFrame) and len(data) > 1:
-                                tenors = data.index.get_level_values(-1).values.astype(float)
-                                values = data.values.flatten()
+                            if len(data_slice) > 1:
+                                # Extract tenors and values
+                                tenors = data_slice.index.get_level_values(2).values.astype(float)
+                                values = data_slice.values.flatten()
                                 
+                                # Debug output for first few iterations
+                                if date == dates[0] and country == countries[0]:
+                                    print(f"\nDebug: Processing {date}, {country}")
+                                    print(f"  Tenors: {tenors}")
+                                    print(f"  Original values: {values[:5]}...")
+                                
+                                # Check if we have enough valid data
                                 if not np.all(np.isnan(values)):
                                     smoothed = self.tenor_smoother.smooth(
                                         tenors, values, 
@@ -509,8 +503,13 @@ class YieldSmoothingFramework:
                                         **config.tenor_params
                                     )
                                     
+                                    if date == dates[0] and country == countries[0]:
+                                        print(f"  Smoothed values: {smoothed[:5]}...")
+                                    
+                                    # Only update if smoothing succeeded and values changed
                                     if not np.all(np.isnan(smoothed)):
-                                        df.loc[slice_idx] = smoothed.reshape(-1, 1)
+                                        # Update the values in place
+                                        df.loc[mask, df.columns[0]] = smoothed
                                         
                     except Exception as e:
                         print(f"Warning: Smoothing failed for {date}, {country}: {str(e)}")
@@ -519,28 +518,32 @@ class YieldSmoothingFramework:
         # Second: smooth across time for each country-tenor (causal)
         if config.time_method != 'none':
             for country in countries:
-                for tenor in df.index.get_level_values(2).unique():
+                unique_tenors = df.index.get_level_values(2).unique()
+                
+                for tenor in unique_tenors:
                     try:
-                        # Use loc with tuple indexing for MultiIndex
-                        # Select all dates for this country-tenor combination
-                        idx = pd.IndexSlice
-                        time_series_data = df.loc[idx[:, country, tenor], :]
+                        # Get mask for this country-tenor combination
+                        mask = (df.index.get_level_values(1) == country) & \
+                               (df.index.get_level_values(2) == tenor)
                         
-                        if len(time_series_data) > 1:
-                            # Sort by date to ensure causality
-                            time_series_data = time_series_data.sort_index()
-                            values = time_series_data.values.flatten()
+                        if mask.any():
+                            time_series_data = df.loc[mask]
                             
-                            if not np.all(np.isnan(values)):
-                                smoothed = self.time_smoother.smooth(
-                                    values,
-                                    config.time_method,
-                                    **config.time_params
-                                )
+                            if len(time_series_data) > 1:
+                                # Sort by date to ensure causality
+                                time_series_data = time_series_data.sort_index()
+                                values = time_series_data.values.flatten()
                                 
-                                if not np.all(np.isnan(smoothed)):
-                                    # Update using the same indexing
-                                    df.loc[idx[:, country, tenor], :] = smoothed.reshape(-1, 1)
+                                if not np.all(np.isnan(values)):
+                                    smoothed = self.time_smoother.smooth(
+                                        values,
+                                        config.time_method,
+                                        **config.time_params
+                                    )
+                                    
+                                    if not np.all(np.isnan(smoothed)):
+                                        # Update using mask
+                                        df.loc[mask, df.columns[0]] = smoothed
                                     
                     except Exception as e:
                         print(f"Warning: Time smoothing failed for {country}, tenor {tenor}: {str(e)}")
@@ -589,7 +592,91 @@ class YieldSmoothingFramework:
 
 
 # Example usage and testing functions
-def create_sample_data() -> pd.DataFrame:
+def diagnose_data_structure(df: pd.DataFrame) -> None:
+    """Diagnose the structure of the yield data."""
+    print("\n" + "="*50)
+    print("Data Structure Diagnosis")
+    print("="*50)
+    
+    print(f"\nDataFrame shape: {df.shape}")
+    print(f"Index type: {type(df.index)}")
+    
+    if isinstance(df.index, pd.MultiIndex):
+        print(f"MultiIndex levels: {df.index.names}")
+        print(f"Number of unique dates: {df.index.get_level_values(0).nunique()}")
+        print(f"Number of unique countries: {df.index.get_level_values(1).nunique()}")
+        print(f"Number of unique tenors: {df.index.get_level_values(2).nunique()}")
+        
+        # Check for duplicates
+        duplicates = df.index.duplicated()
+        n_duplicates = duplicates.sum()
+        print(f"\nDuplicate index entries: {n_duplicates}")
+        
+        if n_duplicates > 0:
+            print("\nWARNING: Duplicate index entries found!")
+            print("This will cause issues with smoothing.")
+            print("\nExample duplicates:")
+            dup_mask = df.index.duplicated(keep=False)
+            sample_dups = df[dup_mask].head(10)
+            print(sample_dups)
+            
+            print("\nSuggestion: Remove duplicates or aggregate them:")
+            print("df = df.groupby(level=[0,1,2]).mean()  # Average duplicates")
+            print("# OR")
+            print("df = df[~df.index.duplicated(keep='first')]  # Keep first")
+        
+        # Check data structure for a sample date-country
+        sample_date = df.index.get_level_values(0).unique()[0]
+        sample_country = df.index.get_level_values(1).unique()[0]
+        
+        print(f"\nSample slice for {sample_date}, {sample_country}:")
+        sample_data = df.loc[(sample_date, sample_country)]
+        print(f"Shape: {sample_data.shape}")
+        print(f"Tenors: {sample_data.index.unique().tolist() if hasattr(sample_data.index, 'unique') else 'N/A'}")
+        print(f"Values:\n{sample_data.head()}")
+    
+    print("\n" + "="*50)
+
+
+def preprocess_data(df: pd.DataFrame, method: str = 'mean') -> pd.DataFrame:
+    """
+    Preprocess data to handle duplicates and ensure proper structure.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe
+    method : str
+        How to handle duplicates: 'mean', 'first', 'last'
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Cleaned dataframe
+    """
+    df_clean = df.copy()
+    
+    # Check for and handle duplicates
+    if df_clean.index.duplicated().any():
+        print(f"Found {df_clean.index.duplicated().sum()} duplicate index entries")
+        
+        if method == 'mean':
+            # Average duplicate entries
+            df_clean = df_clean.groupby(level=list(range(df_clean.index.nlevels))).mean()
+            print(f"Averaged duplicates. New shape: {df_clean.shape}")
+        elif method == 'first':
+            # Keep first occurrence
+            df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
+            print(f"Kept first occurrence. New shape: {df_clean.shape}")
+        elif method == 'last':
+            # Keep last occurrence
+            df_clean = df_clean[~df_clean.index.duplicated(keep='last')]
+            print(f"Kept last occurrence. New shape: {df_clean.shape}")
+    
+    # Ensure sorted index
+    df_clean = df_clean.sort_index()
+    
+    return df_clean
     """Create sample yield curve data for testing - scaled to match user's data."""
     np.random.seed(42)
     
@@ -823,10 +910,70 @@ def grid_search_smoothing(df: pd.DataFrame,
     return results
 
 
+def test_smoothing_step_by_step(df: pd.DataFrame) -> None:
+    """Test smoothing step by step to diagnose issues."""
+    print("\n" + "="*50)
+    print("Step-by-Step Smoothing Test")
+    print("="*50)
+    
+    # Get a sample date and country
+    sample_date = df.index.get_level_values(0).unique()[0]
+    sample_country = df.index.get_level_values(1).unique()[0]
+    
+    print(f"\nTesting with {sample_date}, {sample_country}")
+    
+    # Extract data for this date-country
+    mask = (df.index.get_level_values(0) == sample_date) & \
+           (df.index.get_level_values(1) == sample_country)
+    
+    data_slice = df.loc[mask]
+    print(f"\nOriginal data slice shape: {data_slice.shape}")
+    print(f"Original data:\n{data_slice}")
+    
+    # Extract tenors and values
+    tenors = data_slice.index.get_level_values(2).values.astype(float)
+    values = data_slice.values.flatten()
+    
+    print(f"\nTenors: {tenors}")
+    print(f"Values: {values}")
+    
+    # Test different smoothing methods
+    from scipy.interpolate import UnivariateSpline
+    
+    # Test 1: Pure interpolation
+    print("\n--- Test 1: Pure Interpolation (s=0) ---")
+    spline = UnivariateSpline(tenors, values, k=3, s=0)
+    smoothed_interp = spline(tenors)
+    print(f"Result: {smoothed_interp}")
+    print(f"Changed? {not np.allclose(values, smoothed_interp)}")
+    
+    # Test 2: Light smoothing
+    print("\n--- Test 2: Light Smoothing (s=0.001) ---")
+    data_scale = np.sum(values**2)
+    s_param = 0.01 * data_scale  # 1% error tolerance
+    spline = UnivariateSpline(tenors, values, k=3, s=s_param)
+    smoothed_light = spline(tenors)
+    print(f"Result: {smoothed_light}")
+    print(f"Changed? {not np.allclose(values, smoothed_light)}")
+    
+    # Test 3: Check if all values become the same
+    print(f"\nAll values same after smoothing? {len(np.unique(np.round(smoothed_light, 10))) == 1}")
+    print(f"Unique values in smoothed: {np.unique(np.round(smoothed_light, 10))[:5]}...")
+
+
 if __name__ == "__main__":
     # Example usage
     print("Creating sample data...")
     df = create_sample_data()
+    
+    # Diagnose the data structure
+    diagnose_data_structure(df)
+    
+    # Test smoothing step by step
+    test_smoothing_step_by_step(df)
+    
+    # Clean the data if needed
+    df_clean = preprocess_data(df, method='mean')
     
     print("\nInitializing framework...")
     framework = YieldSmoothingFramework(knot_positions=[2, 5, 10, 30])
