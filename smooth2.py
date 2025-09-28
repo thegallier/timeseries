@@ -519,24 +519,16 @@ class YieldSmoothingFramework:
         # Second: smooth across time for each country-tenor (causal)
         if config.time_method != 'none':
             for country in countries:
-                # Get unique tenors for this country
-                country_data = df.xs(country, level=1)
-                if isinstance(country_data.index, pd.MultiIndex):
-                    unique_tenors = country_data.index.get_level_values(1).unique()
-                else:
-                    unique_tenors = country_data.index.unique()
-                
-                for tenor in unique_tenors:
+                for tenor in df.index.get_level_values(2).unique():
                     try:
-                        # Get time series for this country-tenor
-                        mask = (df.index.get_level_values(1) == country) & \
-                               (df.index.get_level_values(2) == tenor)
-                        
-                        time_series_data = df.loc[mask]
+                        # Use loc with tuple indexing for MultiIndex
+                        # Select all dates for this country-tenor combination
+                        idx = pd.IndexSlice
+                        time_series_data = df.loc[idx[:, country, tenor], :]
                         
                         if len(time_series_data) > 1:
                             # Sort by date to ensure causality
-                            time_series_data = time_series_data.sort_index(level=0)
+                            time_series_data = time_series_data.sort_index()
                             values = time_series_data.values.flatten()
                             
                             if not np.all(np.isnan(values)):
@@ -547,7 +539,8 @@ class YieldSmoothingFramework:
                                 )
                                 
                                 if not np.all(np.isnan(smoothed)):
-                                    df.loc[mask] = smoothed.reshape(-1, 1)
+                                    # Update using the same indexing
+                                    df.loc[idx[:, country, tenor], :] = smoothed.reshape(-1, 1)
                                     
                     except Exception as e:
                         print(f"Warning: Time smoothing failed for {country}, tenor {tenor}: {str(e)}")
