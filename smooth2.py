@@ -47,51 +47,182 @@ class TenorSmoother:
             mask = ~np.isnan(values)
             if np.sum(mask) < 2:
                 return values
-            # Interpolate NaNs first
-            values = np.interp(tenors, tenors[mask], values[mask])
+            # For Bernstein, we need the actual valid points
+            valid_tenors = tenors[mask]
+            valid_values = values[mask]
+        else:
+            valid_tenors = tenors
+            valid_values = values
+            mask = np.ones(len(tenors), dtype=bool)
         
-        # Create Bernstein basis matrix
+        # Need at least degree+1 points
+        if len(valid_values) < degree + 1:
+            # Just interpolate
+            return np.interp(tenors, valid_tenors, valid_values)
+        
+        # Normalize tenors to [0, 1]
+        t_min, t_max = np.min(valid_tenors), np.max(valid_tenors)
+        if t_max - t_min < 1e-10:
+            return values  # All same tenor
+        
+        # Normalize for Bernstein basis
+        t_norm_valid = (valid_tenors - t_min) / (t_max - t_min)
+        t_norm_all = (tenors - t_min) / (t_max - t_min)
+        
+        # Create Bernstein basis matrix for valid points
         n = degree
-        B = np.column_stack([
-            self.bernstein_basis(tenors, n, i) for i in range(n + 1)
+        B_valid = np.column_stack([
+            comb(n, i) * (t_norm_valid ** i) * ((1 - t_norm_valid) ** (n - i))
+            for i in range(n + 1)
         ])
         
-        # Fit coefficients using least squares
-        coeffs, _, _, _ = np.linalg.lstsq(B, values, rcond=None)
+        # Fit coefficients using least squares with regularization
+        # Add small regularization to prevent overfitting
+        regularization = 1e-8 * np.eye(n + 1)
+        try:
+            # Solve (B'B + reg)c = B'y
+            coeffs = np.linalg.solve(
+                B_valid.T @ B_valid + regularization,
+                B_valid.T @ valid_values
+            )
+        except:
+            # If that fails, use pseudoinverse
+            coeffs, _, _, _ = np.linalg.lstsq(B_valid, valid_values, rcond=None)
+        
+        # Create basis for all points
+        B_all = np.column_stack([
+            comb(n, i) * (t_norm_all ** i) * ((1 - t_norm_all) ** (n - i))
+            for i in range(n + 1)
+        ])
         
         # Reconstruct smooth curve
-        return B @ coeffs
+        result = B_all @ coeffs
+        
+        # Diagnostic check
+        if np.ptp(result) < np.ptp(valid_values) * 0.01:  # Lost 99% of variation
+            print(f"Warning: Bernstein over-smoothing (degree={degree}), falling back to interpolation")
+            return np.interp(tenors, valid_tenors, valid_values)
+        
+        return result
     
     def pspline(self, tenors: np.ndarray, values: np.ndarray, 
                 smoothing_param: float = None, degree: int = 3) -> np.ndarray:
         """P-spline smoothing with automatic smoothing parameter selection."""
-        if np.any(np.isnan(values)):
-            # Handle missing values by interpolating first
-            mask = ~np.isnan(values)
-            if np.sum(mask) < 2:
+        # Check for all NaN
+        if np.all(np.isnan(values)):
+            return values
+        
+        # Handle missing values
+        mask = ~np.isnan(values)
+        n_valid = np.sum(mask)
+        
+        # Need at least degree+1 points for spline
+        if n_valid < max(degree + 1, 2):
+            if n_valid < 2:
                 return values
-            values = np.interp(tenors, tenors[mask], values[mask])
+            # Fall back to linear interpolation
+            return np.interp(tenors, tenors[mask], values[mask])
         
-        # Use scipy's UnivariateSpline with specified or automatic smoothing
-        if smoothing_param is None:
-            # Automatic smoothing parameter selection via GCV
-            spline = UnivariateSpline(tenors, values, k=degree)
-        else:
-            spline = UnivariateSpline(tenors, values, k=degree, s=smoothing_param)
+        # Get valid points
+        valid_tenors = tenors[mask]
+        valid_values = values[mask]
         
-        return spline(tenors)
+        try:
+            # Check if tenors are unique and sorted
+            if len(np.unique(valid_tenors)) < len(valid_tenors):
+                # Average duplicate tenor values
+                unique_tenors, indices = np.unique(valid_tenors, return_inverse=True)
+                unique_values = np.zeros(len(unique_tenors))
+                for i, tenor in enumerate(unique_tenors):
+                    unique_values[i] = np.mean(valid_values[valid_tenors == tenor])
+                valid_tenors = unique_tenors
+                valid_values = unique_values
+            
+            # Ensure we have enough unique points
+            if len(valid_tenors) < degree + 1:
+                degree = max(1, len(valid_tenors) - 1)
+            
+            # Create spline
+            if smoothing_param is None:
+                # Use interpolating spline by default - no smoothing
+                spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=0)
+            elif smoothing_param == 0:
+                # Explicitly interpolating spline
+                spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=0)
+            else:
+                # For data in the range -0.08 to 0.08, we need much larger smoothing values
+                # The 's' parameter is the sum of squared residuals that's acceptable
+                # For your data scale, this should be in the range of 0.001 to 0.1
+                
+                # Scale by the sum of squared values to make parameter intuitive
+                data_scale = np.sum(valid_values**2)
+                
+                # smoothing_param is now a fraction of acceptable error (0 to 1)
+                # 0.01 means we accept 1% of the total squared variation as error
+                scaled_smooth = smoothing_param * data_scale
+                
+                spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=scaled_smooth)
+            
+            # Evaluate at all tenor points
+            result = spline(tenors)
+            
+            # Diagnostic check - if all values are nearly identical, something went wrong
+            if np.ptp(result) < np.ptp(valid_values) * 0.1:  # Lost 90% of variation
+                print(f"Warning: Over-smoothing detected (range reduced from {np.ptp(valid_values):.6f} to {np.ptp(result):.6f})")
+                print(f"  Data scale: {data_scale:.6f}, Smoothing param: {smoothing_param}, Scaled: {scaled_smooth:.6f}")
+                # Fall back to interpolation
+                return np.interp(tenors, valid_tenors, valid_values)
+            
+            return result
+            
+        except Exception as e:
+            # If spline fitting fails completely, fall back to linear interpolation
+            print(f"Warning: P-spline fitting failed ({str(e)}), using linear interpolation")
+            return np.interp(tenors, valid_tenors, valid_values)
     
     def cubic_spline(self, tenors: np.ndarray, values: np.ndarray,
                      tension: float = 0.0) -> np.ndarray:
         """Standard cubic spline interpolation."""
-        if np.any(np.isnan(values)):
-            mask = ~np.isnan(values)
-            if np.sum(mask) < 2:
-                return values
-            values = np.interp(tenors, tenors[mask], values[mask])
+        # Check for all NaN
+        if np.all(np.isnan(values)):
+            return values
+            
+        mask = ~np.isnan(values)
+        n_valid = np.sum(mask)
         
-        spline = UnivariateSpline(tenors, values, k=3, s=tension)
-        return spline(tenors)
+        if n_valid < 2:
+            return values
+        
+        if n_valid < 4:
+            # Need at least 4 points for cubic spline, fall back to linear
+            return np.interp(tenors, tenors[mask], values[mask])
+        
+        try:
+            valid_tenors = tenors[mask]
+            valid_values = values[mask]
+            
+            # Handle duplicate tenors
+            if len(np.unique(valid_tenors)) < len(valid_tenors):
+                unique_tenors, indices = np.unique(valid_tenors, return_inverse=True)
+                unique_values = np.zeros(len(unique_tenors))
+                for i, tenor in enumerate(unique_tenors):
+                    unique_values[i] = np.mean(valid_values[valid_tenors == tenor])
+                valid_tenors = unique_tenors
+                valid_values = unique_values
+            
+            spline = UnivariateSpline(valid_tenors, valid_values, k=3, s=tension)
+            result = spline(tenors)
+            
+            # Check for NaN in result
+            if np.any(np.isnan(result)):
+                nan_mask = np.isnan(result)
+                result[nan_mask] = np.interp(tenors[nan_mask], valid_tenors, valid_values)
+            
+            return result
+            
+        except Exception as e:
+            print(f"Warning: Cubic spline failed ({str(e)}), using linear interpolation")
+            return np.interp(tenors, tenors[mask], values[mask])
     
     def monotonic_spline(self, tenors: np.ndarray, values: np.ndarray) -> np.ndarray:
         """Monotonic spline using PCHIP interpolation."""
@@ -355,25 +486,34 @@ class YieldSmoothingFramework:
                                     tenors = np.array(data.index).astype(float)
                                     values = data.values
                                     
+                                    # Check if we have enough valid data
+                                    if not np.all(np.isnan(values)):
+                                        smoothed = self.tenor_smoother.smooth(
+                                            tenors, values, 
+                                            config.tenor_method, 
+                                            **config.tenor_params
+                                        )
+                                        
+                                        # Only update if smoothing succeeded
+                                        if not np.all(np.isnan(smoothed)):
+                                            df.loc[slice_idx] = smoothed
+                                        
+                            elif isinstance(data, pd.DataFrame) and len(data) > 1:
+                                tenors = data.index.get_level_values(-1).values.astype(float)
+                                values = data.values.flatten()
+                                
+                                if not np.all(np.isnan(values)):
                                     smoothed = self.tenor_smoother.smooth(
                                         tenors, values, 
                                         config.tenor_method, 
                                         **config.tenor_params
                                     )
                                     
-                                    df.loc[slice_idx] = smoothed
-                            elif isinstance(data, pd.DataFrame) and len(data) > 1:
-                                tenors = data.index.get_level_values(-1).values.astype(float)
-                                values = data.values.flatten()
-                                
-                                smoothed = self.tenor_smoother.smooth(
-                                    tenors, values, 
-                                    config.tenor_method, 
-                                    **config.tenor_params
-                                )
-                                
-                                df.loc[slice_idx] = smoothed.reshape(-1, 1)
-                    except (KeyError, IndexError) as e:
+                                    if not np.all(np.isnan(smoothed)):
+                                        df.loc[slice_idx] = smoothed.reshape(-1, 1)
+                                        
+                    except Exception as e:
+                        print(f"Warning: Smoothing failed for {date}, {country}: {str(e)}")
                         continue
         
         # Second: smooth across time for each country-tenor (causal)
@@ -399,14 +539,18 @@ class YieldSmoothingFramework:
                             time_series_data = time_series_data.sort_index(level=0)
                             values = time_series_data.values.flatten()
                             
-                            smoothed = self.time_smoother.smooth(
-                                values,
-                                config.time_method,
-                                **config.time_params
-                            )
-                            
-                            df.loc[mask] = smoothed.reshape(-1, 1)
-                    except (KeyError, IndexError) as e:
+                            if not np.all(np.isnan(values)):
+                                smoothed = self.time_smoother.smooth(
+                                    values,
+                                    config.time_method,
+                                    **config.time_params
+                                )
+                                
+                                if not np.all(np.isnan(smoothed)):
+                                    df.loc[mask] = smoothed.reshape(-1, 1)
+                                    
+                    except Exception as e:
+                        print(f"Warning: Time smoothing failed for {country}, tenor {tenor}: {str(e)}")
                         continue
     
     def _smooth_wide_format(self, df: pd.DataFrame, config: SmoothingConfig):
@@ -453,7 +597,7 @@ class YieldSmoothingFramework:
 
 # Example usage and testing functions
 def create_sample_data() -> pd.DataFrame:
-    """Create sample yield curve data for testing."""
+    """Create sample yield curve data for testing - scaled to match user's data."""
     np.random.seed(42)
     
     dates = pd.date_range('2020-01-01', periods=252*5, freq='B')
@@ -466,20 +610,20 @@ def create_sample_data() -> pd.DataFrame:
         names=['date', 'country', 'tenor']
     )
     
-    # Generate synthetic yield changes with structure
+    # Generate synthetic yield changes with structure (SCALED TO USER'S RANGE)
     n = len(index)
     
-    # Create structured yield changes
+    # Create structured yield changes in the range -0.08 to 0.08
     data = []
     for date_idx, date in enumerate(dates):
         for country in countries:
-            # Base level for this country
-            level = np.random.randn() * 0.002
+            # Base level for this country (larger scale)
+            level = np.random.randn() * 0.02  # 2% moves
             
             for tenor_idx, tenor in enumerate(tenors):
                 # Add term structure
-                slope_effect = -0.0001 * np.log(tenor)
-                value = level + slope_effect + np.random.randn() * 0.0003
+                slope_effect = -0.005 * np.log(tenor)
+                value = level + slope_effect + np.random.randn() * 0.01  # 1% noise
                 data.append(value)
     
     df = pd.DataFrame(
@@ -691,18 +835,87 @@ if __name__ == "__main__":
     print("Creating sample data...")
     df = create_sample_data()
     
-    print("\nTesting individual configuration...")
+    print("\nInitializing framework...")
     framework = YieldSmoothingFramework(knot_positions=[2, 5, 10, 30])
     
-    # Test with Bernstein polynomial
-    config = SmoothingConfig(
-        tenor_method='bernstein',
-        time_method='ewma',
-        tenor_params={'degree': 6},
-        time_params={'decay': 0.94}
+    # Test with NO smoothing first to see the data
+    print("\nTesting with NO smoothing to verify data structure...")
+    no_smooth_config = SmoothingConfig(
+        tenor_method='none',
+        time_method='none'
     )
     
-    smoothed = framework.smooth(df, config)
+    original = framework.smooth(df, no_smooth_config)
+    
+    # Check a sample date/country
+    sample_date = df.index.get_level_values(0).unique()[100]
+    sample_country = 'US'
+    sample_data = df.loc[(sample_date, sample_country)]
+    
+    print(f"\nSample data for {sample_date}, {sample_country}:")
+    print(f"Values: {sample_data.values.flatten()}")
+    print(f"Range: {np.ptp(sample_data.values):.6f}")
+    print(f"Mean: {np.mean(sample_data.values):.6f}")
+    print(f"Std: {np.std(sample_data.values):.6f}")
+    
+    print("\n" + "="*50)
+    print("Testing Different Smoothing Approaches for Large-Scale Data")
+    print("="*50)
+    
+    # For data scaled like yours (-0.08 to 0.08), we need different parameters
+    
+    print("\n1. INTERPOLATION only (no smoothing)...")
+    interp_config = SmoothingConfig(
+        tenor_method='pspline',
+        time_method='none',
+        tenor_params={'smoothing_param': 0, 'degree': 3}  # Pure interpolation
+    )
+    
+    interpolated = framework.smooth(df, interp_config)
+    interp_sample = interpolated.loc[(sample_date, sample_country)]
+    
+    print(f"Interpolated values: {interp_sample.values.flatten()[:5]}...")  # Show first 5
+    print(f"Range preserved: {np.ptp(interp_sample.values):.6f}")
+    
+    print("\n2. VERY LIGHT smoothing (1% error tolerance)...")
+    light_config = SmoothingConfig(
+        tenor_method='pspline',
+        time_method='none',
+        tenor_params={'smoothing_param': 0.01, 'degree': 3}  # 1% of squared variation
+    )
+    
+    light_smoothed = framework.smooth(df, light_config)
+    light_sample = light_smoothed.loc[(sample_date, sample_country)]
+    
+    print(f"Light smoothed values: {light_sample.values.flatten()[:5]}...")
+    print(f"Range after smoothing: {np.ptp(light_sample.values):.6f}")
+    print(f"Range reduction: {(1 - np.ptp(light_sample.values)/np.ptp(sample_data.values))*100:.1f}%")
+    
+    print("\n3. MODERATE smoothing (5% error tolerance)...")
+    moderate_config = SmoothingConfig(
+        tenor_method='pspline',
+        time_method='none',
+        tenor_params={'smoothing_param': 0.05, 'degree': 3}  # 5% of squared variation
+    )
+    
+    moderate_smoothed = framework.smooth(df, moderate_config)
+    moderate_sample = moderate_smoothed.loc[(sample_date, sample_country)]
+    
+    print(f"Moderate smoothed values: {moderate_sample.values.flatten()[:5]}...")
+    print(f"Range after smoothing: {np.ptp(moderate_sample.values):.6f}")
+    print(f"Range reduction: {(1 - np.ptp(moderate_sample.values)/np.ptp(sample_data.values))*100:.1f}%")
+    
+    print("\n4. MONOTONIC interpolation...")
+    monotonic_config = SmoothingConfig(
+        tenor_method='monotonic',
+        time_method='none'
+    )
+    
+    monotonic = framework.smooth(df, monotonic_config)
+    mono_sample = monotonic.loc[(sample_date, sample_country)]
+    
+    print(f"Monotonic values: {mono_sample.values.flatten()[:5]}...")
+    print(f"Range: {np.ptp(mono_sample.values):.6f}")
     
     print(f"Original shape: {df.shape}")
     print(f"Smoothed shape: {smoothed.shape}")
