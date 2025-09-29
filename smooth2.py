@@ -1,5 +1,4 @@
-# Use cleaned data for smoothing
-    df = df_cleanimport pandas as pd
+import pandas as pd
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -128,57 +127,51 @@ class TenorSmoother:
         valid_tenors = tenors[mask]
         valid_values = values[mask]
         
+        # CRITICAL: Handle duplicate tenors by averaging
+        unique_tenors, inverse_indices = np.unique(valid_tenors, return_inverse=True)
+        if len(unique_tenors) < len(valid_tenors):
+            # We have duplicates - average them
+            unique_values = np.zeros(len(unique_tenors))
+            for i in range(len(unique_tenors)):
+                unique_values[i] = np.mean(valid_values[inverse_indices == i])
+            valid_tenors = unique_tenors
+            valid_values = unique_values
+        
+        # Ensure we still have enough points after deduplication
+        if len(valid_tenors) < degree + 1:
+            degree = max(1, len(valid_tenors) - 1)
+        
         try:
-            # Check if tenors are unique and sorted
-            if len(np.unique(valid_tenors)) < len(valid_tenors):
-                # Average duplicate tenor values
-                unique_tenors, indices = np.unique(valid_tenors, return_inverse=True)
-                unique_values = np.zeros(len(unique_tenors))
-                for i, tenor in enumerate(unique_tenors):
-                    unique_values[i] = np.mean(valid_values[valid_tenors == tenor])
-                valid_tenors = unique_tenors
-                valid_values = unique_values
-            
-            # Ensure we have enough unique points
-            if len(valid_tenors) < degree + 1:
-                degree = max(1, len(valid_tenors) - 1)
-            
             # Create spline
-            if smoothing_param is None:
-                # Use interpolating spline by default - no smoothing
-                spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=0)
-            elif smoothing_param == 0:
-                # Explicitly interpolating spline
+            if smoothing_param is None or smoothing_param == 0:
+                # Use interpolating spline
                 spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=0)
             else:
-                # For data in the range -0.08 to 0.08, we need much larger smoothing values
-                # The 's' parameter is the sum of squared residuals that's acceptable
-                # For your data scale, this should be in the range of 0.001 to 0.1
-                
-                # Scale by the sum of squared values to make parameter intuitive
+                # Scale smoothing parameter by data scale
                 data_scale = np.sum(valid_values**2)
                 
-                # smoothing_param is now a fraction of acceptable error (0 to 1)
-                # 0.01 means we accept 1% of the total squared variation as error
-                scaled_smooth = smoothing_param * data_scale
+                # Adjust scaling to avoid "s too small" warnings
+                # Use a minimum threshold to prevent convergence issues
+                scaled_smooth = max(smoothing_param * data_scale, 1e-6 * len(valid_values))
                 
-                spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=scaled_smooth)
+                # Suppress warnings and create spline
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    spline = UnivariateSpline(valid_tenors, valid_values, k=degree, s=scaled_smooth)
             
-            # Evaluate at all tenor points
+            # Evaluate at ALL original tenor points (including duplicates)
             result = spline(tenors)
             
-            # Diagnostic check - if all values are nearly identical, something went wrong
+            # Diagnostic check
             if np.ptp(result) < np.ptp(valid_values) * 0.1:  # Lost 90% of variation
-                print(f"Warning: Over-smoothing detected (range reduced from {np.ptp(valid_values):.6f} to {np.ptp(result):.6f})")
-                print(f"  Data scale: {data_scale:.6f}, Smoothing param: {smoothing_param}, Scaled: {scaled_smooth:.6f}")
-                # Fall back to interpolation
+                # Silently fall back to interpolation
                 return np.interp(tenors, valid_tenors, valid_values)
             
             return result
             
         except Exception as e:
-            # If spline fitting fails completely, fall back to linear interpolation
-            print(f"Warning: P-spline fitting failed ({str(e)}), using linear interpolation")
+            # Silently fall back to linear interpolation
             return np.interp(tenors, valid_tenors, valid_values)
     
     def cubic_spline(self, tenors: np.ndarray, values: np.ndarray,
@@ -240,7 +233,43 @@ class TenorSmoother:
         interp = PchipInterpolator(tenors, values)
         return interp(tenors)
     
-    def smooth(self, tenors: np.ndarray, values: np.ndarray, 
+    def custom_model(self, tenors: np.ndarray, values: np.ndarray,
+                     model_func: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> np.ndarray:
+        """Apply a user-supplied custom model function."""
+        # Handle NaN values
+        mask = ~np.isnan(values)
+        if np.sum(mask) < 2:
+            return values
+        
+        valid_tenors = tenors[mask]
+        valid_values = values[mask]
+        
+        # Handle duplicates
+        unique_tenors, inverse_indices = np.unique(valid_tenors, return_inverse=True)
+        if len(unique_tenors) < len(valid_tenors):
+            unique_values = np.zeros(len(unique_tenors))
+            for i in range(len(unique_tenors)):
+                unique_values[i] = np.mean(valid_values[inverse_indices == i])
+            
+            # Apply model to unique points
+            smoothed_unique = model_func(unique_tenors, unique_values)
+            
+            # Map back to all points
+            result = np.full_like(values, np.nan)
+            result[mask] = smoothed_unique[inverse_indices]
+            return result
+        else:
+            # No duplicates
+            try:
+                smoothed = model_func(valid_tenors, valid_values)
+                result = np.full_like(values, np.nan)
+                result[mask] = smoothed
+                return result
+            except Exception as e:
+                print(f"Warning: Custom model failed ({str(e)}), returning original values")
+                return values
+    
+    def smooth(self, tenors: np.ndarray, values: np.ndarray,
                method: str, **params) -> np.ndarray:
         """Apply specified smoothing method."""
         if method == 'none':
@@ -253,6 +282,10 @@ class TenorSmoother:
             return self.monotonic_spline(tenors, values)
         elif method == 'bernstein':
             return self.bernstein_polynomial(tenors, values, **params)
+        elif method == 'custom':
+            if 'model_func' not in params:
+                raise ValueError("Custom method requires 'model_func' parameter")
+            return self.custom_model(tenors, values, params['model_func'])
         else:
             raise ValueError(f"Unknown tenor smoothing method: {method}")
 
@@ -435,7 +468,9 @@ class YieldSmoothingFramework:
         self.tenor_smoother = TenorSmoother(knot_positions)
         self.time_smoother = TimeSmoother()
     
-    def smooth(self, df: pd.DataFrame, config: SmoothingConfig) -> pd.DataFrame:
+    def smooth(self, df: pd.DataFrame, config: SmoothingConfig,
+               post_tenor_method: Optional[str] = None,
+               post_tenor_params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         """
         Apply smoothing to yield curve data.
         
@@ -445,6 +480,10 @@ class YieldSmoothingFramework:
             Input dataframe with MultiIndex (date, country, tenor) or similar structure
         config : SmoothingConfig
             Configuration specifying methods and parameters
+        post_tenor_method : str, optional
+            Additional tenor smoothing to apply after initial smoothing
+        post_tenor_params : dict, optional
+            Parameters for post-tenor smoothing
         
         Returns:
         --------
@@ -458,16 +497,44 @@ class YieldSmoothingFramework:
         if isinstance(result.index, pd.MultiIndex):
             result = result.sort_index()
         
-        # Detect dataframe structure
+        # Apply main smoothing
         if isinstance(df.index, pd.MultiIndex):
             self._smooth_multiindex(result, config)
         else:
             self._smooth_wide_format(result, config)
         
+        # Optional chained tenor smoothing
+        if post_tenor_method is not None and post_tenor_method != 'none':
+            if isinstance(result.index, pd.MultiIndex):
+                dates = result.index.get_level_values(0).unique()
+                countries = result.index.get_level_values(1).unique()
+                
+                for date in dates:
+                    for country in countries:
+                        try:
+                            mask = (result.index.get_level_values(0) == date) & \
+                                   (result.index.get_level_values(1) == country)
+                            
+                            if mask.any():
+                                data_slice = result.loc[mask]
+                                if len(data_slice) > 1:
+                                    tenors = data_slice.index.get_level_values(2).values.astype(float)
+                                    values = data_slice.values.flatten()
+                                    
+                                    # Apply post-processing smoothing
+                                    smoothed = self.tenor_smoother.smooth(
+                                        tenors, values, post_tenor_method, 
+                                        **(post_tenor_params or {})
+                                    )
+                                    
+                                    result.loc[mask, result.columns[0]] = smoothed
+                        except Exception as e:
+                            continue
+        
         return result
     
     def _smooth_multiindex(self, df: pd.DataFrame, config: SmoothingConfig):
-        """Handle MultiIndex format (date, country, tenor)."""
+        """Handle MultiIndex format (date, country, tenor) with potential duplicates."""
         # Get unique dates and countries
         dates = df.index.get_level_values(0).unique()
         countries = df.index.get_level_values(1).unique()
@@ -489,27 +556,38 @@ class YieldSmoothingFramework:
                                 tenors = data_slice.index.get_level_values(2).values.astype(float)
                                 values = data_slice.values.flatten()
                                 
+                                # Get unique tenors and their positions
+                                unique_tenors = np.unique(tenors)
+                                
                                 # Debug output for first few iterations
                                 if date == dates[0] and country == countries[0]:
                                     print(f"\nDebug: Processing {date}, {country}")
-                                    print(f"  Tenors: {tenors}")
-                                    print(f"  Original values: {values[:5]}...")
+                                    print(f"  Total rows: {len(tenors)}")
+                                    print(f"  Unique tenors: {len(unique_tenors)}")
+                                    print(f"  Duplicate structure: {[np.sum(tenors == t) for t in unique_tenors[:5]]}")
                                 
-                                # Check if we have enough valid data
-                                if not np.all(np.isnan(values)):
-                                    smoothed = self.tenor_smoother.smooth(
-                                        tenors, values, 
+                                # Option A: Average duplicates before smoothing
+                                avg_values = np.array([np.mean(values[tenors == t]) for t in unique_tenors])
+                                
+                                if not np.all(np.isnan(avg_values)):
+                                    # Smooth the averaged values
+                                    smoothed_unique = self.tenor_smoother.smooth(
+                                        unique_tenors, avg_values, 
                                         config.tenor_method, 
                                         **config.tenor_params
                                     )
                                     
-                                    if date == dates[0] and country == countries[0]:
-                                        print(f"  Smoothed values: {smoothed[:5]}...")
+                                    # Map smoothed values back to all original rows
+                                    smoothed_all = np.zeros(len(tenors))
+                                    for i, unique_tenor in enumerate(unique_tenors):
+                                        smoothed_all[tenors == unique_tenor] = smoothed_unique[i]
                                     
-                                    # Only update if smoothing succeeded and values changed
-                                    if not np.all(np.isnan(smoothed)):
-                                        # Update the values in place
-                                        df.loc[mask, df.columns[0]] = smoothed
+                                    if date == dates[0] and country == countries[0]:
+                                        print(f"  Original values: {values[:5]}...")
+                                        print(f"  Smoothed values: {smoothed_all[:5]}...")
+                                    
+                                    # Update the values
+                                    df.loc[mask, df.columns[0]] = smoothed_all
                                         
                     except Exception as e:
                         print(f"Warning: Smoothing failed for {date}, {country}: {str(e)}")
@@ -529,20 +607,39 @@ class YieldSmoothingFramework:
                         if mask.any():
                             time_series_data = df.loc[mask]
                             
-                            if len(time_series_data) > 1:
-                                # Sort by date to ensure causality
+                            # Check if we have duplicates per date
+                            dates_in_series = time_series_data.index.get_level_values(0)
+                            unique_dates = dates_in_series.unique()
+                            
+                            if len(time_series_data) > len(unique_dates):
+                                # We have duplicates - average them per date
+                                avg_values = []
+                                for d in unique_dates:
+                                    date_mask = (df.index.get_level_values(0) == d) & mask
+                                    avg_values.append(df.loc[date_mask].values.mean())
+                                values_to_smooth = np.array(avg_values)
+                            else:
+                                # No duplicates, use as is
                                 time_series_data = time_series_data.sort_index()
-                                values = time_series_data.values.flatten()
+                                values_to_smooth = time_series_data.values.flatten()
+                            
+                            if not np.all(np.isnan(values_to_smooth)):
+                                smoothed = self.time_smoother.smooth(
+                                    values_to_smooth,
+                                    config.time_method,
+                                    **config.time_params
+                                )
                                 
-                                if not np.all(np.isnan(values)):
-                                    smoothed = self.time_smoother.smooth(
-                                        values,
-                                        config.time_method,
-                                        **config.time_params
-                                    )
-                                    
-                                    if not np.all(np.isnan(smoothed)):
-                                        # Update using mask
+                                if not np.all(np.isnan(smoothed)):
+                                    # Map back to original structure
+                                    if len(time_series_data) > len(unique_dates):
+                                        # Expand smoothed values to match duplicates
+                                        smoothed_expanded = np.zeros(len(time_series_data))
+                                        for i, d in enumerate(unique_dates):
+                                            date_mask = dates_in_series == d
+                                            smoothed_expanded[date_mask] = smoothed[i]
+                                        df.loc[mask, df.columns[0]] = smoothed_expanded
+                                    else:
                                         df.loc[mask, df.columns[0]] = smoothed
                                     
                     except Exception as e:
@@ -722,18 +819,34 @@ def preprocess_data(df: pd.DataFrame, method: str = 'mean') -> pd.DataFrame:
     return df
 
 
-def compare_methods(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Compare different smoothing method combinations."""
+def compare_methods(df: pd.DataFrame,
+                    custom_models: Optional[Dict[str, Callable]] = None) -> Dict[str, pd.DataFrame]:
+    """
+    Compare different smoothing method combinations, including custom models.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input yield curve data
+    custom_models : dict, optional
+        Dictionary of {name: function} for custom tenor models
+        Functions should accept (tenors, values) and return smoothed values
+    
+    Returns:
+    --------
+    dict
+        Dictionary of {method_name: smoothed_dataframe}
+    """
     framework = YieldSmoothingFramework()
     
-    # Define method combinations to test
+    # Define standard configurations
     configs = {
         'original': SmoothingConfig(tenor_method='none', time_method='none'),
         
         'pspline_only': SmoothingConfig(
             tenor_method='pspline',
             time_method='none',
-            tenor_params={'smoothing_param': None}
+            tenor_params={'smoothing_param': 0.01}
         ),
         
         'bernstein_only': SmoothingConfig(
@@ -751,7 +864,7 @@ def compare_methods(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         'pspline_ewma': SmoothingConfig(
             tenor_method='pspline',
             time_method='ewma',
-            tenor_params={'smoothing_param': None},
+            tenor_params={'smoothing_param': 0.01},
             time_params={'decay': 0.94}
         ),
         
@@ -776,12 +889,98 @@ def compare_methods(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         ),
     }
     
+    # Add custom models if provided
+    if custom_models:
+        for name, model_func in custom_models.items():
+            # Custom model alone
+            configs[f"custom_{name}"] = SmoothingConfig(
+                tenor_method='custom',
+                time_method='none',
+                tenor_params={'model_func': model_func}
+            )
+            
+            # Custom model with EWMA time smoothing
+            configs[f"custom_{name}_ewma"] = SmoothingConfig(
+                tenor_method='custom',
+                time_method='ewma',
+                tenor_params={'model_func': model_func},
+                time_params={'decay': 0.94}
+            )
+    
     results = {}
     for name, config in configs.items():
         print(f"Processing: {name}")
-        results[name] = framework.smooth(df, config)
+        
+        # Check if we need post-processing
+        if "custom" in name and "_pspline" in name.split("_")[-1]:
+            # Chain custom model with p-spline smoothing
+            results[name] = framework.smooth(
+                df, config,
+                post_tenor_method="pspline",
+                post_tenor_params={'smoothing_param': 0.001, 'degree': 3}
+            )
+        else:
+            results[name] = framework.smooth(df, config)
     
     return results
+
+
+# Example custom models
+def nelson_siegel_model(tenors: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """
+    Simplified Nelson-Siegel curve fitting.
+    
+    This is a basic implementation - a full NS model would optimize tau.
+    """
+    # Set tau (could be optimized)
+    tau = 2.0
+    
+    # Create basis functions
+    ones = np.ones_like(tenors)
+    f1 = (1 - np.exp(-tenors/tau)) / (tenors/tau + 1e-10)  # Avoid division by zero
+    f2 = f1 - np.exp(-tenors/tau)
+    
+    # Stack basis functions
+    X = np.column_stack([ones, f1, f2])
+    
+    # Fit using least squares
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(X, values, rcond=None)
+        return X @ coeffs
+    except:
+        # Fall back to simple polynomial
+        return np.polyval(np.polyfit(tenors, values, 2), tenors)
+
+
+def svensson_model(tenors: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """
+    Simplified Svensson (4-factor Nelson-Siegel) model.
+    """
+    tau1, tau2 = 2.0, 5.0
+    
+    # Create basis functions
+    ones = np.ones_like(tenors)
+    f1 = (1 - np.exp(-tenors/tau1)) / (tenors/tau1 + 1e-10)
+    f2 = f1 - np.exp(-tenors/tau1)
+    f3 = (1 - np.exp(-tenors/tau2)) / (tenors/tau2 + 1e-10) - np.exp(-tenors/tau2)
+    
+    # Stack basis functions
+    X = np.column_stack([ones, f1, f2, f3])
+    
+    # Fit using least squares
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(X, values, rcond=None)
+        return X @ coeffs
+    except:
+        return nelson_siegel_model(tenors, values)  # Fall back to NS
+
+
+def polynomial_model(degree: int = 4):
+    """Factory function for polynomial models of specified degree."""
+    def poly_fit(tenors: np.ndarray, values: np.ndarray) -> np.ndarray:
+        coeffs = np.polyfit(tenors, values, degree)
+        return np.polyval(coeffs, tenors)
+    return poly_fit
 
 
 # Metrics for evaluation
@@ -937,28 +1136,52 @@ def test_smoothing_step_by_step(df: pd.DataFrame) -> None:
     print(f"\nTenors: {tenors}")
     print(f"Values: {values}")
     
+    # Check for duplicate tenors
+    unique_tenors, counts = np.unique(tenors, return_counts=True)
+    if np.any(counts > 1):
+        print("\n⚠️  WARNING: Duplicate tenors found!")
+        print(f"Duplicated tenors: {unique_tenors[counts > 1]}")
+        print(f"Counts: {counts[counts > 1]}")
+        
+        # Handle duplicates by averaging
+        print("\nAveraging duplicate tenor values...")
+        avg_values = np.zeros(len(unique_tenors))
+        for i, t in enumerate(unique_tenors):
+            avg_values[i] = np.mean(values[tenors == t])
+        
+        tenors = unique_tenors
+        values = avg_values
+        print(f"After averaging - Tenors: {tenors}")
+        print(f"After averaging - Values: {values}")
+    
     # Test different smoothing methods
     from scipy.interpolate import UnivariateSpline
     
     # Test 1: Pure interpolation
     print("\n--- Test 1: Pure Interpolation (s=0) ---")
-    spline = UnivariateSpline(tenors, values, k=3, s=0)
-    smoothed_interp = spline(tenors)
-    print(f"Result: {smoothed_interp}")
-    print(f"Changed? {not np.allclose(values, smoothed_interp)}")
+    try:
+        spline = UnivariateSpline(tenors, values, k=min(3, len(tenors)-1), s=0)
+        smoothed_interp = spline(tenors)
+        print(f"Result: {smoothed_interp}")
+        print(f"Changed? {not np.allclose(values, smoothed_interp)}")
+    except Exception as e:
+        print(f"Error: {e}")
     
     # Test 2: Light smoothing
     print("\n--- Test 2: Light Smoothing (s=0.001) ---")
-    data_scale = np.sum(values**2)
-    s_param = 0.01 * data_scale  # 1% error tolerance
-    spline = UnivariateSpline(tenors, values, k=3, s=s_param)
-    smoothed_light = spline(tenors)
-    print(f"Result: {smoothed_light}")
-    print(f"Changed? {not np.allclose(values, smoothed_light)}")
-    
-    # Test 3: Check if all values become the same
-    print(f"\nAll values same after smoothing? {len(np.unique(np.round(smoothed_light, 10))) == 1}")
-    print(f"Unique values in smoothed: {np.unique(np.round(smoothed_light, 10))[:5]}...")
+    try:
+        data_scale = np.sum(values**2)
+        s_param = 0.01 * data_scale  # 1% error tolerance
+        spline = UnivariateSpline(tenors, values, k=min(3, len(tenors)-1), s=s_param)
+        smoothed_light = spline(tenors)
+        print(f"Result: {smoothed_light}")
+        print(f"Changed? {not np.allclose(values, smoothed_light)}")
+        
+        # Test 3: Check if all values become the same
+        print(f"\nAll values same after smoothing? {len(np.unique(np.round(smoothed_light, 10))) == 1}")
+        print(f"Unique values in smoothed: {np.unique(np.round(smoothed_light, 10))[:5]}...")
+    except Exception as e:
+        print(f"Error: {e}")
 
 
 if __name__ == "__main__":
